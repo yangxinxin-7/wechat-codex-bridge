@@ -128,6 +128,8 @@ interface FinalDelivery {
 
 interface PendingInboundMerge {
   event: InboundTextEvent;
+  lastUpdatedAtMs: number;
+  messageCount: number;
   queued: boolean;
   cancelled: boolean;
   cancellation: Promise<void>;
@@ -232,7 +234,7 @@ export class WeixinBridgeRuntime {
     previewHardLimitBytes = 2048,
     previewIntervalMs = 3000,
     typingKeepaliveMs = WeixinBridgeRuntime.DEFAULT_TYPING_KEEPALIVE_MS,
-    inboundAttachmentMergeWindowMs = 3000,
+    inboundAttachmentMergeWindowMs = 1500,
     automationPollMs = 30_000,
     internalThreadCleanupMs = 24 * 60 * 60 * 1000,
     locale = null,
@@ -399,48 +401,39 @@ export class WeixinBridgeRuntime {
     }
 
     const pending = this.pendingInboundMerges.get(scopeId) ?? null;
+    if (parseSlashCommand(String(event?.text ?? ''))) {
+      void this.flushPendingInboundMerge(scopeId);
+      return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
+    }
     if (pending) {
-      if (parseSlashCommand(String(event?.text ?? ''))) {
-        void this.flushPendingInboundMerge(scopeId);
-        return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
-      }
       pending.event = mergeInboundEvents(pending.event, event);
+      pending.lastUpdatedAtMs = Date.now();
+      pending.messageCount += 1;
       debugRuntime('pending_inbound_merge_updated', {
         scopeId, mediaPending: Boolean(pending.event.attachmentDownload),
         attachmentCount: pending.event.attachments?.length ?? 0,
         hasText: Boolean(pending.event.text.trim()), queued: pending.queued,
       });
       if (!pending.queued) {
-        if (shouldDelayInboundEvent(pending.event)) this.armPendingInboundMerge(scopeId, pending);
+        if (this.inboundAttachmentMergeWindowMs > 0) this.armPendingInboundMerge(scopeId, pending);
         else void this.flushPendingInboundMerge(scopeId);
       }
       return pending.completion;
     }
 
-    // Register media even while the previous turn is running. Keep this entry
-    // open for captions until it reaches the head of the queue and is ready.
-    if (hasAttachments(event)) {
-      const deferred = createPendingInboundMerge(event);
-      this.pendingInboundMerges.set(scopeId, deferred);
-      debugRuntime('pending_inbound_merge_started', {
-        scopeId, mediaPending: Boolean(event.attachmentDownload),
-        attachmentCount: event.attachments?.length ?? 0,
-        queuedBehindActiveTurn: this.scopeChains.has(scopeId),
-      });
-      if (shouldDelayInboundEvent(event)) this.armPendingInboundMerge(scopeId, deferred);
-      else void this.flushPendingInboundMerge(scopeId);
-      return deferred.completion;
-    }
-
-    if (this.scopeChains.has(scopeId)) {
-      const deferred = createPendingInboundMerge(event);
-      this.pendingInboundMerges.set(scopeId, deferred);
-      debugRuntime('scope_busy_queued', { scopeId, textPreview: truncateDebugText(event?.text), attachmentCount: 0 });
-      void this.flushPendingInboundMerge(scopeId);
-      return deferred.completion;
-    }
-
-    return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
+    // Text can arrive before its image. Hold every ordinary input until the
+    // conversation has been quiet for the merge window, then await its media.
+    const deferred = createPendingInboundMerge(event);
+    this.pendingInboundMerges.set(scopeId, deferred);
+    debugRuntime('pending_inbound_merge_started', {
+      scopeId, mediaPending: Boolean(event.attachmentDownload),
+      attachmentCount: event.attachments?.length ?? 0,
+      mergeWindowMs: this.inboundAttachmentMergeWindowMs,
+      queuedBehindActiveTurn: this.scopeChains.has(scopeId),
+    });
+    if (this.inboundAttachmentMergeWindowMs > 0) this.armPendingInboundMerge(scopeId, deferred);
+    else void this.flushPendingInboundMerge(scopeId);
+    return deferred.completion;
   }
 
   cancelPendingInboundMerge(scopeId: string): void {
@@ -480,10 +473,24 @@ export class WeixinBridgeRuntime {
     this.clearPendingInboundTimer(pending);
     debugRuntime('pending_inbound_merge_queued', { scopeId, queuedBehindActiveTurn: this.scopeChains.has(scopeId) });
     const operation = this.enqueueScopeWork(scopeId, async () => {
-      // Captions can keep joining while media downloads or the previous turn
-      // runs. Freeze the batch only when it is ready to be sent to Codex.
-      if (pending.cancelled) return { type: 'cancelled' };
-      while (pending.event.attachmentDownload) {
+      // Inputs can keep joining while downloads or previous turns run. Check
+      // the quiet window again after every wait before freezing the batch.
+      while (true) {
+        if (pending.cancelled) return { type: 'cancelled' };
+        const quietWaitMs = pending.lastUpdatedAtMs + this.inboundAttachmentMergeWindowMs - Date.now();
+        if (quietWaitMs > 0) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              new Promise<void>(resolve => { timer = setTimeout(resolve, quietWaitMs); }),
+              pending.cancellation,
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          continue;
+        }
+        if (!pending.event.attachmentDownload) break;
         const snapshot = pending.event;
         const ready = await Promise.race([
           resolveInboundAttachmentDownload(snapshot), pending.cancellation.then(() => null),
@@ -493,6 +500,10 @@ export class WeixinBridgeRuntime {
       }
       if (this.pendingInboundMerges.get(scopeId) === pending) this.pendingInboundMerges.delete(scopeId);
       const event = pending.event;
+      debugRuntime('pending_inbound_merge_ready', {
+        scopeId, readyAtMs: Date.now(), messageCount: pending.messageCount,
+        attachmentCount: event.attachments?.length ?? 0, hasText: Boolean(event.text.trim()),
+      });
       const errors = isRecord(event.metadata?.weixin) ? extractStringArray(event.metadata.weixin.attachmentErrors) : [];
       if (errors.length > 0 && !event.attachments?.length) {
         const text = this.i18n.t('runtime.error.inboundMediaFailed');
@@ -2240,6 +2251,8 @@ function createPendingInboundMerge(event: InboundTextEvent): PendingInboundMerge
   });
   return {
     event,
+    lastUpdatedAtMs: Date.now(),
+    messageCount: 1,
     queued: false,
     cancelled: false, cancellation, cancel,
     timer: null,
@@ -2285,13 +2298,6 @@ async function resolveInboundAttachmentDownload(event: InboundTextEvent): Promis
     attachmentErrors: errors,
     mediaTimings: [...(Array.isArray(previous.mediaTimings) ? previous.mediaTimings : []), ...result.timings],
   } } };
-}
-
-function shouldDelayInboundEvent(event: InboundTextEvent): boolean {
-  return !parseSlashCommand(String(event?.text ?? ''))
-    && !isLocalKeepalivePulse(event)
-    && hasAttachments(event)
-    && !String(event?.text ?? '').trim();
 }
 
 function isLocalKeepalivePulse(event: InboundTextEvent | null | undefined): boolean {

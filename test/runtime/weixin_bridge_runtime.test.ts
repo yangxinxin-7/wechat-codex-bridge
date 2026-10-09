@@ -58,7 +58,7 @@ function makeRuntime({
   previewSoftTargetBytes = 1,
   previewIntervalMs = 0,
   typingKeepaliveMs = 8000,
-  inboundAttachmentMergeWindowMs = 3000,
+  inboundAttachmentMergeWindowMs = 0,
   automationPollMs = 30_000,
   internalThreadCleanupMs = 0,
   pollEvents = null,
@@ -156,6 +156,7 @@ test('WeixinBridgeRuntime defaults to one final reply without commentary or answ
     internalThreadCleanupMs: 0,
   });
   assert.equal(runtime.progressDeliveryEnabled, false);
+  assert.equal(runtime.inboundAttachmentMergeWindowMs, 1500);
   await runtime.runOnce();
   assert.deepEqual(sent, [final]);
 });
@@ -554,6 +555,104 @@ test('WeixinBridgeRuntime merges an image-only inbound message with the next tex
   ]);
 });
 
+for (const textFirst of [true, false]) {
+  test(`WeixinBridgeRuntime merges ${textFirst ? 'text before image' : 'image before text'} arriving 1006ms apart and waits for download`, async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10_000 });
+    let finishDownload!: (result: any) => void;
+    const attachmentDownload = new Promise<any>(resolve => { finishDownload = resolve; });
+    const seen: any[] = [];
+    const runtime = makeRuntime({
+      inboundAttachmentMergeWindowMs: 1500,
+      sendText: async () => {},
+      coordinator: { async handleInboundEvent(event: any) { seen.push(event); return completeResponse('完成'); } },
+    });
+    const text = { platform: 'weixin', externalScopeId: 'wxid_1', text: '这个也带上墨镜' };
+    const photo = { platform: 'weixin', externalScopeId: 'wxid_1', text: '', attachmentDownload };
+    const first = await runtime.dispatchInboundEvent(textFirst ? text : photo);
+    t.mock.timers.tick(1006);
+    const second = await runtime.dispatchInboundEvent(textFirst ? photo : text);
+    t.mock.timers.tick(1499);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(seen, []);
+    t.mock.timers.tick(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(seen, []);
+    finishDownload({ attachments: [{ kind: 'image', localPath: '/tmp/photo.jpg' }], errors: [], timings: [] });
+    await Promise.all([first.completion, second.completion]);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, '这个也带上墨镜');
+    assert.equal(seen[0].attachments[0].localPath, '/tmp/photo.jpg');
+    assert.equal(seen[0].attachmentDownload, undefined);
+    assert.equal(runtime.pendingInboundMerges.size, 0);
+  });
+}
+
+test('WeixinBridgeRuntime restarts the quiet window for captions arriving while a download finishes', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10_000 });
+  let finishDownload!: (result: any) => void;
+  const attachmentDownload = new Promise<any>(resolve => { finishDownload = resolve; });
+  const seen: any[] = [];
+  const runtime = makeRuntime({
+    inboundAttachmentMergeWindowMs: 1500, sendText: async () => {},
+    coordinator: { async handleInboundEvent(event: any) { seen.push(event); return completeResponse('完成'); } },
+  });
+  const photo = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '', attachmentDownload });
+  t.mock.timers.tick(1600);
+  await new Promise(resolve => setImmediate(resolve));
+  const caption = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '戴墨镜' });
+  finishDownload({ attachments: [{ kind: 'image', localPath: '/tmp/photo.jpg' }], errors: [], timings: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1499);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(seen, []);
+  t.mock.timers.tick(1);
+  await Promise.all([photo.completion, caption.completion]);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].text, '戴墨镜');
+});
+
+test('WeixinBridgeRuntime merges adjacent text messages per scope and creates another turn after the window', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10_000 });
+  const seen: any[] = [];
+  const runtime = makeRuntime({
+    inboundAttachmentMergeWindowMs: 1500, sendText: async () => {},
+    coordinator: { async handleInboundEvent(event: any) { seen.push(event); return completeResponse('完成'); } },
+  });
+  const first = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '第一句' });
+  t.mock.timers.tick(1000);
+  const second = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '第二句' });
+  const other = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_2', text: '另一个会话' });
+  t.mock.timers.tick(1499);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(seen, []);
+  t.mock.timers.tick(1);
+  await Promise.all([first.completion, second.completion, other.completion]);
+  assert.equal(seen.length, 2);
+  assert.equal(seen.find(event => event.externalScopeId === 'wxid_1').text, '第一句\n\n第二句');
+  assert.equal(seen.find(event => event.externalScopeId === 'wxid_2').text, '另一个会话');
+  const next = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '下一轮' });
+  t.mock.timers.tick(1500);
+  await next.completion;
+  assert.equal(seen.length, 3);
+  assert.equal(seen[2].text, '下一轮');
+});
+
+test('WeixinBridgeRuntime /stop cancels text waiting for the merge window', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10_000 });
+  const seen: string[] = [];
+  const runtime = makeRuntime({
+    inboundAttachmentMergeWindowMs: 1500, sendText: async () => {},
+    coordinator: { async handleInboundEvent(event: any) { seen.push(event.text); return completeResponse('完成'); } },
+  });
+  const text = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '还未提交' });
+  await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '/stop' });
+  t.mock.timers.tick(1500);
+  await text.completion;
+  await runtime.waitForIdle();
+  assert.deepEqual(seen, ['/stop']);
+  assert.equal(runtime.pendingInboundMerges.size, 0);
+});
+
 test('WeixinBridgeRuntime accepts arbitrary captions while an image downloads beyond the merge window', async () => {
   let finishDownload!: (result: any) => void;
   const attachmentDownload = new Promise<any>(resolve => { finishDownload = resolve; });
@@ -579,18 +678,20 @@ test('WeixinBridgeRuntime accepts arbitrary captions while an image downloads be
 test('WeixinBridgeRuntime queues late images behind an active text turn and merges following captions', async () => {
   let finishTurn!: () => void;
   const turnGate = new Promise<void>(resolve => { finishTurn = resolve; });
+  let markTurnStarted!: () => void;
+  const turnStarted = new Promise<void>(resolve => { markTurnStarted = resolve; });
   const seen: any[] = [];
   const sent: string[] = [];
   const runtime = makeRuntime({ inboundAttachmentMergeWindowMs: 1,
     sendText: async ({content}) => { sent.push(content); },
     coordinator: { async handleInboundEvent(event: any) {
       seen.push(event);
-      if (event.text === '先处理这个') await turnGate;
+      if (event.text === '先处理这个') { markTurnStarted(); await turnGate; }
       return completeResponse('完成');
     } },
   });
   const first = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'先处理这个'});
-  await new Promise(resolve => setImmediate(resolve));
+  await turnStarted;
   const earlyCaption = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'戴墨镜'});
   const photo = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'',attachments:[{kind:'image',localPath:'/tmp/late.jpg'}]});
   await new Promise(resolve => setTimeout(resolve,10));
@@ -702,6 +803,8 @@ test('WeixinBridgeRuntime flushes an image-only inbound message after the merge 
 
 test('WeixinBridgeRuntime dispatches plain-text turns in the background so slash commands can run immediately', async () => {
   const sent: Array<{ externalScopeId: string; content: string }> = [];
+  let markTurnStarted!: () => void;
+  const turnStarted = new Promise<void>(resolve => { markTurnStarted = resolve; });
   let releaseTurn: (value?: unknown) => void = () => {};
   const turnGate = new Promise((resolve) => {
     releaseTurn = resolve;
@@ -713,6 +816,7 @@ test('WeixinBridgeRuntime dispatches plain-text turns in the background so slash
     coordinator: {
       async handleInboundEvent(event: any) {
         if (event.text === 'hello') {
+          markTurnStarted();
           await turnGate;
           return completeResponse('final answer');
         }
@@ -731,6 +835,7 @@ test('WeixinBridgeRuntime dispatches plain-text turns in the background so slash
   });
   assert.equal(scheduled.type, 'scheduled');
   assert.equal(typeof scheduled.completion?.then, 'function');
+  await turnStarted;
   await runtime.dispatchInboundEvent({
     platform: 'weixin',
     externalScopeId: 'wxid_1',
