@@ -80,6 +80,12 @@ systemctl --user stop com.ganxing.codexbridge-weixin.service
 
 微信发送限流或登录失效时，请查看日志并在微信重新发一条消息；需要时重新扫码绑定。
 
+文字和图片的接收时间默认记录在 `~/.codexbridge/logs/weixin-bridge.err.log` 的 `[weixin-inbound] message_received` 中。`receivedAtMs` / `receivedAt` 是微信接口返回该批消息时的服务器时间（ISO 时间为 UTC），`messageCreatedAtMs` 是微信提供的消息时间，`arrivalDeltaMs` 是同一会话与上一条消息的接收间隔，单位毫秒；第一条为 `null`。同一批返回的消息接收间隔为 0，`batchIndex` 保留微信返回的先后顺序。图片下载耗时另见 `download_started` / `download_completed`，不计入接收间隔。
+
+```bash
+tail -F ~/.codexbridge/logs/weixin-bridge.err.log | rg --line-buffered '\[weixin-inbound\] message_received'
+```
+
 ## 验证范围
 
 微信图片回传已经真实验证，收发、会话、连接及本次修复的相关测试已通过。2026-10-09 已安装并启动 Linux systemd 用户服务，并验证最新 Codex 的真实模型调用。上游全量类型检查仍有 provider-relay 示例依赖等原有错误，不作为本部署的前置步骤。

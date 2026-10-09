@@ -65,6 +65,8 @@ interface WeixinInboundMetadata extends Record<string, unknown> {
     roomId: string | null;
     chatType: 'group' | 'dm';
     messageId: string | null;
+    receivedAtMs: number;
+    messageCreatedAtMs: number | null;
     contextTokenPresent: boolean;
     attachmentCount: number;
     attachmentErrors?: string[];
@@ -135,6 +137,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     this.nowFn = nowFn;
     this.messageSendQueue = Promise.resolve();
     this.nextMessageSendAt = 0;
+    this.lastInboundReceipts = new Map();
   }
 
   id: string;
@@ -151,6 +154,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
   i18n: Translator;
   messageSendQueue: Promise<void>;
   nextMessageSendAt: number;
+  lastInboundReceipts: Map<string, { messageId: string | null; receivedAtMs: number }>;
 
   async start() {
     if (this.running && this.client) {
@@ -175,9 +179,14 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     this.configManager?.clear();
     this.configManager = null;
     this.client = null;
+    this.lastInboundReceipts.clear();
   }
 
-  async normalizeInboundEvent(payload: WeixinInboundPayload, { deferMedia = false } = {}): Promise<WeixinNormalizedEvent | null> {
+  async normalizeInboundEvent(payload: WeixinInboundPayload, {
+    deferMedia = false,
+    receivedAtMs: batchReceivedAtMs,
+    batchIndex = null,
+  }: { deferMedia?: boolean; receivedAtMs?: number; batchIndex?: number | null } = {}): Promise<WeixinNormalizedEvent | null> {
     const senderId = stringValue(payload.from_user_id);
     if (!senderId || senderId === this.config.accountId) {
       debugWeixin('drop_message', {
@@ -197,8 +206,32 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       return null;
     }
     const text = extractText(payload.item_list ?? []);
-    const receivedAtMs = this.nowFn();
+    // All messages in one getUpdates response arrive together. Capture that
+    // time before normalization, typing requests, or media downloads begin.
+    const receivedAtMs = batchReceivedAtMs ?? this.nowFn();
     const hasMedia = (payload.item_list ?? []).some(isMediaItem);
+    const messageId = stringValue(payload.message_id);
+    const messageCreatedAtMs = typeof payload.create_time_ms === 'number' && Number.isFinite(payload.create_time_ms)
+      ? payload.create_time_ms : null;
+    if (text || hasMedia) {
+      const previous = this.lastInboundReceipts.get(scope.externalScopeId);
+      this.lastInboundReceipts.set(scope.externalScopeId, { messageId, receivedAtMs });
+      writeSequencedDebugLog('weixin-inbound', 'message_received', {
+        accountId: this.config.accountId,
+        scopeId: scope.externalScopeId,
+        messageId,
+        receivedAtMs,
+        receivedAt: new Date(receivedAtMs).toISOString(),
+        messageCreatedAtMs,
+        batchIndex,
+        hasText: Boolean(text),
+        hasMedia,
+        itemTypes: (payload.item_list ?? []).map(item => item.type ?? null),
+        previousMessageId: previous?.messageId ?? null,
+        previousReceivedAtMs: previous?.receivedAtMs ?? null,
+        arrivalDeltaMs: previous ? receivedAtMs - previous.receivedAtMs : null,
+      }, { envVar: null });
+    }
     const download = async (): Promise<InboundAttachmentDownloadResult> => {
       const downloadStartedAtMs = this.nowFn();
       writeSequencedDebugLog('weixin-media', 'download_started', {
@@ -258,6 +291,8 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
           roomId: scope.chatType === 'group' ? scope.externalScopeId : null,
           chatType: scope.chatType,
           messageId: stringValue(payload.message_id),
+          receivedAtMs,
+          messageCreatedAtMs,
           contextTokenPresent: Boolean(contextToken),
           attachmentCount: attachments.length,
           attachmentErrors,
@@ -309,6 +344,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       syncCursorPreview: previewCursor(syncCursor),
     });
     const response = await this.client.getUpdates({ syncCursor });
+    const receivedAtMs = this.nowFn();
     if (isSessionExpiredResponse(response)) {
       pauseSession(this.config.accountId);
       return {
@@ -328,7 +364,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     });
     const events: WeixinNormalizedEvent[] = [];
     const seenInboundKeys = new Set<string>();
-    for (const message of rawMessages) {
+    for (const [batchIndex, message] of rawMessages.entries()) {
       const dedupeKey = buildInboundDedupeKey(message);
       if (dedupeKey && seenInboundKeys.has(dedupeKey)) {
         debugWeixin('drop_message', {
@@ -339,7 +375,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
         });
         continue;
       }
-      const event = await this.normalizeInboundEvent(message, { deferMedia });
+      const event = await this.normalizeInboundEvent(message, { deferMedia, receivedAtMs, batchIndex });
       if (!event) {
         continue;
       }

@@ -383,6 +383,63 @@ test('WeixinPlatformPlugin pollOnce normalizes incoming messages and defers sync
   assert.equal(accountStore.getContextToken('bot-account', 'wxid_sender'), 'ctx-2');
 });
 
+test('WeixinPlatformPlugin logs batch receipt times independently of media processing and compares arrivals per scope', async (t) => {
+  const rootDir = makeTempAccountsDir();
+  const accountStore = new WeixinAccountStore({ rootDir });
+  accountStore.saveAccount({ accountId: 'bot-account', token: 'private-token', baseUrl: 'https://ilink.example.com' });
+  let now = 1_000;
+  const plugin = makePlugin({
+    accountStore,
+    config: loadWeixinConfig({ accountStore, env: { WEIXIN_ACCOUNT_ID: 'bot-account', WEIXIN_DM_POLICY: 'open' } }),
+    nowFn: () => now,
+  });
+  const logs: string[] = [];
+  t.mock.method(process.stderr, 'write', (chunk: unknown) => {
+    logs.push(String(chunk));
+    return true;
+  });
+  let poll = 0;
+  (plugin as any).client = {
+    async getUpdates() {
+      poll++;
+      if (poll === 2) now = 7_000;
+      return { msgs: poll === 1 ? [
+        { from_user_id: 'sender', message_id: 'text-1', create_time_ms: 800, item_list: [{ type: 1, text_item: { text: 'private caption' } }] },
+        { from_user_id: 'sender', message_id: 'image-1', create_time_ms: 500, item_list: [{ type: 2, image_item: {} }] },
+      ] : [
+        { from_user_id: 'sender', message_id: 'text-2', item_list: [{ type: 1, text_item: { text: 'next' } }] },
+        { from_user_id: 'other-sender', message_id: 'other-1', item_list: [{ type: 1, text_item: { text: 'other' } }] },
+      ] };
+    },
+  };
+  plugin.ensureTypingTicket = async () => { now += 100; return 'typing-ticket'; };
+  plugin.downloadInboundAttachments = async () => {
+    now += 5_000;
+    return { attachments: [{ kind: 'image', localPath: '/tmp/image.jpg' }], errors: [] };
+  };
+  try {
+    const first = await plugin.pollOnce();
+    const second = await plugin.pollOnce();
+    assert.deepEqual(first.events.map(event => event.metadata.weixin.receivedAtMs), [1_000, 1_000]);
+    assert.equal(second.events[0].metadata.weixin.receivedAtMs, 7_000);
+    const receipts = logs.filter(line => line.includes('[weixin-inbound] message_received '))
+      .map(line => JSON.parse(line.slice(line.indexOf('message_received ') + 'message_received '.length)));
+    assert.equal(receipts.length, 4);
+    assert.deepEqual(receipts.map(entry => entry.arrivalDeltaMs), [null, 0, 6_000, null]);
+    assert.deepEqual(receipts.slice(0, 2).map(entry => entry.batchIndex), [0, 1]);
+    assert.equal(receipts[1].previousMessageId, 'text-1');
+    assert.equal(receipts[1].receivedAt, '1970-01-01T00:00:01.000Z');
+    assert.equal(receipts[1].messageCreatedAtMs, 500);
+    assert.equal(receipts[1].hasMedia, true);
+    assert.equal(receipts[2].previousMessageId, 'image-1');
+    assert.equal(receipts[2].messageCreatedAtMs, null);
+    assert.ok(!logs.filter(line => line.includes('[weixin-inbound]')).join('').includes('private caption'));
+    assert.ok(logs.findIndex(line => line.includes('"messageId":"image-1"')) < logs.findIndex(line => line.includes('download_started')));
+  } finally {
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('WeixinPlatformPlugin pollOnce keeps events when typing ticket refresh fails', async () => {
   const rootDir = makeTempAccountsDir();
   const accountStore = new WeixinAccountStore({ rootDir });
