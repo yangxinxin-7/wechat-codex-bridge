@@ -2,7 +2,7 @@ import { decryptAesEcb } from './aes_ecb.js';
 import { buildCdnDownloadUrl, ENABLE_CDN_URL_FALLBACK } from './cdn_url.js';
 
 async function fetchCdnBytes(url: string, label: string): Promise<Buffer> {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
   if (!res.ok) {
     const body = await res.text().catch(() => '(unreadable)');
     throw new Error(`${label}: CDN download ${res.status} ${res.statusText} body=${body}`);

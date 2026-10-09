@@ -6,6 +6,7 @@ import { createI18n, type Translator } from '../i18n/index.js';
 import type { MissionHostNotification } from '../../packages/mission-control/src/index.js';
 import type {
   InboundTextEvent,
+  InboundAttachmentDownloadResult,
   PlatformMediaDeliveryResult,
 } from '../types/platform.js';
 import type { OutputArtifact, ProviderApprovalRequest, ProviderTurnProgress } from '../types/provider.js';
@@ -53,7 +54,7 @@ interface RuntimeResponse {
 interface PlatformPluginLike {
   start(): Promise<void>;
   stop(): Promise<void>;
-  pollOnce(): Promise<{ syncCursor?: string | null; events: InboundTextEvent[] }>;
+  pollOnce(params?: { deferMedia?: boolean }): Promise<{ syncCursor?: string | null; events: InboundTextEvent[] }>;
   commitSyncCursor?(syncCursor: string | null | undefined): Promise<void> | void;
   sendText(params: { externalScopeId: string; content: string }): Promise<DeliveryResult | null | undefined>;
   sendTyping?(params: { externalScopeId: string; status: 'start' | 'stop' }): Promise<void> | void;
@@ -127,6 +128,10 @@ interface FinalDelivery {
 
 interface PendingInboundMerge {
   event: InboundTextEvent;
+  queued: boolean;
+  cancelled: boolean;
+  cancellation: Promise<void>;
+  cancel: () => void;
   timer: ReturnType<typeof setTimeout> | null;
   completion: Promise<RuntimeResponse>;
   resolve: (response: RuntimeResponse) => void;
@@ -292,7 +297,7 @@ export class WeixinBridgeRuntime {
   }
 
   async runOnce(): Promise<{ syncCursor?: string | null; events: InboundTextEvent[] }> {
-    const result = await this.platformPlugin.pollOnce();
+    const result = await this.platformPlugin.pollOnce({ deferMedia: true });
     const dispatch = await this.dispatchEvents(result.events ?? []);
     await dispatch.completion;
     await this.platformPlugin.commitSyncCursor?.(result.syncCursor);
@@ -323,7 +328,8 @@ export class WeixinBridgeRuntime {
     }
     const command = parseSlashCommand(String(event?.text ?? ''));
     if (command) {
-      await this.flushPendingInboundMerge(event.externalScopeId);
+      if (['stop', 'new', 'open'].includes(command.name)) this.cancelPendingInboundMerge(event.externalScopeId);
+      else await this.flushPendingInboundMerge(event.externalScopeId);
       if (shouldScheduleSlashCommand(command)) {
         const task = this.processInboundEventWithOptions(event, { deferPostResponseAction: true }).catch(async (error) => {
           await this.onError(error);
@@ -398,72 +404,54 @@ export class WeixinBridgeRuntime {
         void this.flushPendingInboundMerge(scopeId);
         return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
       }
-      const mergedEvent = mergeInboundEvents(pending.event, event);
-      if (shouldDelayInboundEvent(mergedEvent)) {
-        pending.event = mergedEvent;
-        debugRuntime('pending_inbound_merge_updated', {
-          scopeId,
-          attachmentCount: Array.isArray(mergedEvent.attachments) ? mergedEvent.attachments.length : 0,
-          hasText: Boolean(String(mergedEvent.text ?? '').trim()),
-        });
-        this.armPendingInboundMerge(scopeId, pending);
-        return pending.completion;
-      }
-      this.pendingInboundMerges.delete(scopeId);
-      this.clearPendingInboundTimer(pending);
-      const operation = this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(mergedEvent));
-      operation.then(pending.resolve, pending.reject);
-      return operation;
-    }
-
-    if (this.scopeChains.has(scopeId)) {
-      debugRuntime('scope_busy_rejected', {
-        scopeId,
-        textPreview: truncateDebugText(event?.text),
-        attachmentCount: Array.isArray(event?.attachments) ? event.attachments.length : 0,
+      pending.event = mergeInboundEvents(pending.event, event);
+      debugRuntime('pending_inbound_merge_updated', {
+        scopeId, mediaPending: Boolean(pending.event.attachmentDownload),
+        attachmentCount: pending.event.attachments?.length ?? 0,
+        hasText: Boolean(pending.event.text.trim()), queued: pending.queued,
       });
-      return this.respondWhileScopeBusy(event);
+      if (!pending.queued) {
+        if (shouldDelayInboundEvent(pending.event)) this.armPendingInboundMerge(scopeId, pending);
+        else void this.flushPendingInboundMerge(scopeId);
+      }
+      return pending.completion;
     }
 
-    if (shouldDelayInboundEvent(event)) {
+    // Register media even while the previous turn is running. Keep this entry
+    // open for captions until it reaches the head of the queue and is ready.
+    if (hasAttachments(event)) {
       const deferred = createPendingInboundMerge(event);
       this.pendingInboundMerges.set(scopeId, deferred);
       debugRuntime('pending_inbound_merge_started', {
-        scopeId,
-        attachmentCount: Array.isArray(event.attachments) ? event.attachments.length : 0,
+        scopeId, mediaPending: Boolean(event.attachmentDownload),
+        attachmentCount: event.attachments?.length ?? 0,
+        queuedBehindActiveTurn: this.scopeChains.has(scopeId),
       });
-      this.armPendingInboundMerge(scopeId, deferred);
+      if (shouldDelayInboundEvent(event)) this.armPendingInboundMerge(scopeId, deferred);
+      else void this.flushPendingInboundMerge(scopeId);
+      return deferred.completion;
+    }
+
+    if (this.scopeChains.has(scopeId)) {
+      const deferred = createPendingInboundMerge(event);
+      this.pendingInboundMerges.set(scopeId, deferred);
+      debugRuntime('scope_busy_queued', { scopeId, textPreview: truncateDebugText(event?.text), attachmentCount: 0 });
+      void this.flushPendingInboundMerge(scopeId);
       return deferred.completion;
     }
 
     return this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(event));
   }
 
-  async respondWhileScopeBusy(event: InboundTextEvent): Promise<RuntimeResponse> {
-    const content = [
-      this.i18n.t('coordinator.blocked.active'),
-      this.i18n.t('coordinator.blocked.waitOrStop'),
-    ].join('\n');
-    const typingStart = this.safeSendTyping(event.externalScopeId, 'start');
-    try {
-      const delivery = await this.sendTextWithRetry({
-        externalScopeId: event.externalScopeId,
-        content,
-      });
-      if (!delivery.success && this.isRateLimitedDeliveryFailure(delivery)) {
-        await this.ensureScopeNoticeDelivered(
-          event.externalScopeId,
-          this.i18n.t('runtime.error.weixinRateLimitedNotice'),
-        );
-      }
-      return {
-        type: 'message',
-        messages: [{ text: content }],
-      };
-    } finally {
-      await typingStart;
-      await this.safeSendTyping(event.externalScopeId, 'stop');
-    }
+  cancelPendingInboundMerge(scopeId: string): void {
+    const pending = this.pendingInboundMerges.get(scopeId);
+    if (!pending) return;
+    pending.cancelled = true;
+    pending.cancel();
+    this.clearPendingInboundTimer(pending);
+    this.pendingInboundMerges.delete(scopeId);
+    pending.resolve({ type: 'cancelled' });
+    debugRuntime('pending_inbound_merge_cancelled', { scopeId });
   }
 
   armPendingInboundMerge(scopeId: string, pending: PendingInboundMerge): void {
@@ -487,19 +475,35 @@ export class WeixinBridgeRuntime {
       return;
     }
     const pending = this.pendingInboundMerges.get(scopeId);
-    if (!pending) {
-      return;
-    }
-    this.pendingInboundMerges.delete(scopeId);
+    if (!pending || pending.queued) return;
+    pending.queued = true;
     this.clearPendingInboundTimer(pending);
-    debugRuntime('pending_inbound_merge_flushed', {
-      scopeId,
-      attachmentCount: Array.isArray(pending.event.attachments) ? pending.event.attachments.length : 0,
-      hasText: Boolean(String(pending.event.text ?? '').trim()),
+    debugRuntime('pending_inbound_merge_queued', { scopeId, queuedBehindActiveTurn: this.scopeChains.has(scopeId) });
+    const operation = this.enqueueScopeWork(scopeId, async () => {
+      // Captions can keep joining while media downloads or the previous turn
+      // runs. Freeze the batch only when it is ready to be sent to Codex.
+      if (pending.cancelled) return { type: 'cancelled' };
+      while (pending.event.attachmentDownload) {
+        const snapshot = pending.event;
+        const ready = await Promise.race([
+          resolveInboundAttachmentDownload(snapshot), pending.cancellation.then(() => null),
+        ]);
+        if (!ready || pending.cancelled) return { type: 'cancelled' };
+        if (pending.event === snapshot) pending.event = ready;
+      }
+      if (this.pendingInboundMerges.get(scopeId) === pending) this.pendingInboundMerges.delete(scopeId);
+      const event = pending.event;
+      const errors = isRecord(event.metadata?.weixin) ? extractStringArray(event.metadata.weixin.attachmentErrors) : [];
+      if (errors.length > 0 && !event.attachments?.length) {
+        const text = this.i18n.t('runtime.error.inboundMediaFailed');
+        await this.sendTextWithRetry({ externalScopeId: scopeId, content: text });
+        return { type: 'message', messages: [{ text }] };
+      }
+      return this.processInboundEvent(event);
     });
-    const operation = this.enqueueScopeWork(scopeId, async () => this.processInboundEvent(pending.event));
     operation.then(pending.resolve, pending.reject);
-    await operation.catch(() => {});
+    this.trackBackgroundTask(operation);
+    // Do not await this queued turn here: control commands must remain usable.
   }
 
   async flushAllPendingInboundMerges(): Promise<void> {
@@ -2226,6 +2230,8 @@ async function waitForPreviewWindow(streamState: StreamState, waitUntil: number)
 }
 
 function createPendingInboundMerge(event: InboundTextEvent): PendingInboundMerge {
+  let cancel: () => void = () => {};
+  const cancellation = new Promise<void>(resolve => { cancel = resolve; });
   let resolve: (response: RuntimeResponse) => void = () => {};
   let reject: (error: unknown) => void = () => {};
   const completion = new Promise<RuntimeResponse>((resolvePromise, rejectPromise) => {
@@ -2234,6 +2240,8 @@ function createPendingInboundMerge(event: InboundTextEvent): PendingInboundMerge
   });
   return {
     event,
+    queued: false,
+    cancelled: false, cancellation, cancel,
     timer: null,
     completion,
     resolve,
@@ -2250,6 +2258,35 @@ function shouldScheduleSlashCommand(command: { name?: string | null; args?: stri
   return !args.some((arg) => ['-h', '--help', '-help', '-helps'].includes(String(arg ?? '').trim().toLowerCase()));
 }
 
+function mergeAttachmentDownloads(
+  first?: Promise<InboundAttachmentDownloadResult>, second?: Promise<InboundAttachmentDownloadResult>,
+): Promise<InboundAttachmentDownloadResult> | undefined {
+  if (!first) return second;
+  if (!second) return first;
+  return Promise.all([first, second]).then(results => ({
+    attachments: results.flatMap(result => result.attachments),
+    errors: results.flatMap(result => result.errors),
+    timings: results.flatMap(result => result.timings),
+  }));
+}
+
+async function resolveInboundAttachmentDownload(event: InboundTextEvent): Promise<InboundTextEvent> {
+  if (!event.attachmentDownload) return event;
+  let result: InboundAttachmentDownloadResult;
+  try { result = await event.attachmentDownload; }
+  catch { result = { attachments: [], errors: ['media_download_failed'], timings: [] }; }
+  const { attachmentDownload: _download, ...ready } = event;
+  const previous = isRecord(event.metadata?.weixin) ? event.metadata.weixin : {};
+  const attachments = [...(event.attachments ?? []), ...result.attachments];
+  const errors = [...extractStringArray(previous.attachmentErrors), ...result.errors];
+  if (!attachments.length && !errors.length && !event.text.trim()) errors.push('no_downloadable_media');
+  return { ...ready, attachments, metadata: { ...event.metadata, weixin: {
+    ...previous, mediaPending: false, attachmentCount: attachments.length,
+    attachmentErrors: errors,
+    mediaTimings: [...(Array.isArray(previous.mediaTimings) ? previous.mediaTimings : []), ...result.timings],
+  } } };
+}
+
 function shouldDelayInboundEvent(event: InboundTextEvent): boolean {
   return !parseSlashCommand(String(event?.text ?? ''))
     && !isLocalKeepalivePulse(event)
@@ -2263,7 +2300,7 @@ function isLocalKeepalivePulse(event: InboundTextEvent | null | undefined): bool
 }
 
 function hasAttachments(event: InboundTextEvent | null | undefined): boolean {
-  return Array.isArray(event?.attachments) && event.attachments.length > 0;
+  return Boolean(event?.attachmentDownload) || (Array.isArray(event?.attachments) && event.attachments.length > 0);
 }
 
 function mergeInboundEvents(baseEvent: InboundTextEvent, nextEvent: InboundTextEvent): InboundTextEvent {
@@ -2271,6 +2308,7 @@ function mergeInboundEvents(baseEvent: InboundTextEvent, nextEvent: InboundTextE
     ...baseEvent,
     ...nextEvent,
     text: combineEventText(baseEvent.text, nextEvent.text),
+    attachmentDownload: mergeAttachmentDownloads(baseEvent.attachmentDownload, nextEvent.attachmentDownload),
     attachments: [
       ...(Array.isArray(baseEvent.attachments) ? baseEvent.attachments : []),
       ...(Array.isArray(nextEvent.attachments) ? nextEvent.attachments : []),

@@ -1134,3 +1134,42 @@ test('WeixinPlatformPlugin keeps fenced code blocks intact when splitting long t
   assert.match(codeBlockChunk, /--project agent-social-publisher/);
   assert.match(codeBlockChunk, /```/);
 });
+
+test('WeixinPlatformPlugin registers pending images and keeps polling while media and typing config are slow', async () => {
+  const rootDir = makeTempAccountsDir();
+  const accountStore = new WeixinAccountStore({ rootDir });
+  accountStore.saveAccount({ accountId:'bot-account', token:'token', baseUrl:'https://ilink.example.com', userId:'wxid_sender' });
+  const plugin = makePlugin({ accountStore, config:loadWeixinConfig({ accountStore, env:{WEIXIN_ACCOUNT_ID:'bot-account', WEIXIN_DM_POLICY:'open'} }) });
+  let finishDownload!:(result:any)=>void;
+  const gate = new Promise<any>(resolve=>{finishDownload=resolve;});
+  let finishTyping!:(result:any)=>void;
+  const typingGate = new Promise<any>(resolve=>{finishTyping=resolve;});
+  let count=0;
+  plugin.downloadInboundAttachments = async ()=>gate;
+  (plugin as any).client = {
+    async getUpdates() {
+      count++;
+      return {get_updates_buf:`cursor-${count}`,msgs:[{from_user_id:'wxid_sender',to_user_id:'bot-account',message_id:`message-${count}`,context_token:'ctx',item_list:count===1
+        ? [{type:2,image_item:{media:{full_url:'https://cdn.example.com/photo.jpg'}}}]
+        : [{type:1,text_item:{text:'红色的那个换成蓝色'}}]}]};
+    },
+    async getConfig(){return typingGate;},
+  };
+  try {
+    const first=await plugin.pollOnce({deferMedia:true});
+    assert.equal(first.events.length,1);
+    assert.ok(first.events[0].attachmentDownload);
+    assert.deepEqual(first.events[0].attachments,[]);
+    assert.equal(accountStore.getContextToken('bot-account','wxid_sender'),'ctx');
+    const second=await plugin.pollOnce({deferMedia:true,syncCursor:first.syncCursor});
+    assert.equal(second.events[0].text,'红色的那个换成蓝色');
+    finishDownload({attachments:[{kind:'image',localPath:'/tmp/photo.jpg'}],errors:[]});
+    const downloaded=await first.events[0].attachmentDownload;
+    assert.equal(downloaded?.attachments.length,1);
+    assert.ok(downloaded?.timings[0].downloadCompletedAtMs! >= downloaded?.timings[0].receivedAtMs!);
+  } finally {
+    finishTyping({typing_ticket:'ticket'});
+    await new Promise(resolve=>setImmediate(resolve));
+    fs.rmSync(rootDir,{recursive:true,force:true});
+  }
+});

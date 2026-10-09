@@ -35,6 +35,7 @@ import { writeSequencedDebugLog } from '../../core/sequenced_stderr.js';
 import { createI18n, type Translator } from '../../i18n/index.js';
 import type {
   InboundAttachment,
+  InboundAttachmentDownloadResult,
   InboundTextEvent,
   PlatformDeliveryRequest,
   PlatformMediaDeliveryResult,
@@ -67,6 +68,8 @@ interface WeixinInboundMetadata extends Record<string, unknown> {
     contextTokenPresent: boolean;
     attachmentCount: number;
     attachmentErrors?: string[];
+    mediaPending?: boolean;
+    mediaTimings?: InboundAttachmentDownloadResult['timings'];
   };
 }
 
@@ -174,7 +177,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     this.client = null;
   }
 
-  async normalizeInboundEvent(payload: WeixinInboundPayload): Promise<WeixinNormalizedEvent | null> {
+  async normalizeInboundEvent(payload: WeixinInboundPayload, { deferMedia = false } = {}): Promise<WeixinNormalizedEvent | null> {
     const senderId = stringValue(payload.from_user_id);
     if (!senderId || senderId === this.config.accountId) {
       debugWeixin('drop_message', {
@@ -194,8 +197,31 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       return null;
     }
     const text = extractText(payload.item_list ?? []);
-    const { attachments, errors: attachmentErrors } = await this.downloadInboundAttachments(payload);
-    if (!text && attachments.length === 0 && attachmentErrors.length === 0) {
+    const receivedAtMs = this.nowFn();
+    const hasMedia = (payload.item_list ?? []).some(isMediaItem);
+    const download = async (): Promise<InboundAttachmentDownloadResult> => {
+      const downloadStartedAtMs = this.nowFn();
+      writeSequencedDebugLog('weixin-media', 'download_started', {
+        scopeId: scope.externalScopeId, messageId: stringValue(payload.message_id),
+        receivedAtMs, downloadStartedAtMs,
+        messageCreatedAtMs: payload.create_time_ms ?? null,
+      }, { envVar: null });
+      let result: { attachments: InboundAttachment[]; errors: string[] };
+      try { result = await this.downloadInboundAttachments(payload); }
+      catch (error) { result = { attachments: [], errors: [error instanceof Error ? error.message : String(error)] }; }
+      const downloadCompletedAtMs = this.nowFn();
+      const timing = { messageId: stringValue(payload.message_id), receivedAtMs, downloadStartedAtMs, downloadCompletedAtMs };
+      writeSequencedDebugLog('weixin-media', 'download_completed', {
+        scopeId: scope.externalScopeId, ...timing,
+        downloadDurationMs: downloadCompletedAtMs - downloadStartedAtMs,
+        attachmentCount: result.attachments.length, errorCount: result.errors.length,
+      }, { envVar: null });
+      return { ...result, timings: [timing] };
+    };
+    const attachmentDownload = hasMedia && deferMedia ? download() : undefined;
+    const downloaded = hasMedia && !deferMedia ? await download() : { attachments: [], errors: [], timings: [] };
+    const { attachments, errors: attachmentErrors } = downloaded;
+    if (!text && !attachmentDownload && attachments.length === 0 && attachmentErrors.length === 0) {
       debugWeixin('drop_message', {
         reason: 'no_supported_content',
         scopeId: scope.externalScopeId,
@@ -225,6 +251,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       externalScopeId: scope.externalScopeId,
       text,
       attachments,
+      ...(attachmentDownload ? { attachmentDownload } : {}),
       metadata: {
         weixin: {
           senderId,
@@ -234,6 +261,8 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
           contextTokenPresent: Boolean(contextToken),
           attachmentCount: attachments.length,
           attachmentErrors,
+          mediaPending: Boolean(attachmentDownload),
+          mediaTimings: downloaded.timings,
         },
       },
     };
@@ -256,7 +285,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
     return this.accountStore.loadSyncCursor(this.config.accountId);
   }
 
-  async pollOnce({ syncCursor: requestedSyncCursor = null }: { syncCursor?: string | null } = {}) {
+  async pollOnce({ syncCursor: requestedSyncCursor = null, deferMedia = false }: { syncCursor?: string | null; deferMedia?: boolean } = {}) {
     if (!this.client) {
       throw new Error(this.i18n.t('platform.weixin.plugin.pollOnceNotStarted'));
     }
@@ -310,7 +339,7 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
         });
         continue;
       }
-      const event = await this.normalizeInboundEvent(message);
+      const event = await this.normalizeInboundEvent(message, { deferMedia });
       if (!event) {
         continue;
       }
@@ -319,10 +348,11 @@ export class WeixinPlatformPlugin implements Pick<PlatformPluginContract, 'id' |
       }
       const senderId = event.metadata?.weixin?.senderId;
       if (typeof senderId === 'string' && senderId) {
-        try {
-          await this.ensureTypingTicket(senderId);
-        } catch {
-          // Typing indicators are optional; message delivery should continue.
+        if (deferMedia) {
+          // Typing is optional and must not block receiving the next batch.
+          void this.ensureTypingTicket(senderId).catch(() => {});
+        } else {
+          try { await this.ensureTypingTicket(senderId); } catch { /* optional */ }
         }
       }
       events.push(event);

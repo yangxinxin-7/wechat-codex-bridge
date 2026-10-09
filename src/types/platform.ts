@@ -11,9 +11,22 @@ export interface InboundAttachment {
   durationSeconds?: number | null;
 }
 
+export interface InboundAttachmentDownloadResult {
+  attachments: InboundAttachment[];
+  errors: string[];
+  timings: Array<{
+    messageId: string | null;
+    receivedAtMs: number;
+    downloadStartedAtMs: number;
+    downloadCompletedAtMs: number;
+  }>;
+}
+
 export interface InboundTextEvent extends PlatformScopeRef {
   text: string;
   attachments?: InboundAttachment[];
+  /** Weixin registers media before downloading it; runtimes resolve this before provider dispatch. */
+  attachmentDownload?: Promise<InboundAttachmentDownloadResult>;
   cwd?: string | null;
   locale?: string | null;
   metadata?: Record<string, unknown>;

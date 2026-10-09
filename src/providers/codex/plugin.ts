@@ -9,6 +9,7 @@ import type { CodexTurnInput } from './app_client.js';
 import { CodexCliReviewRunner } from './review_runner.js';
 import { buildCodexPermissionRuntimeOverrides } from '../../core/permissions_mode.js';
 import { resolveReasoningEffortForProvider } from '../shared/thinking_policy.js';
+import { writeSequencedDebugLog } from '../../core/sequenced_stderr.js';
 import { buildTurnArtifactDeveloperInstructions } from '../../core/turn_artifacts.js';
 import type {
   BridgeSession,
@@ -361,6 +362,14 @@ export class CodexProviderPlugin {
     const developerInstructions = buildDeveloperInstructions(event);
     const personality = normalizeCodexPersonality(sessionSettings?.personality ?? null);
     const permissionOverrides = buildCodexPermissionRuntimeOverrides(sessionSettings);
+    if (event.attachments?.length) {
+      writeSequencedDebugLog('weixin-media', 'provider_input_submitted', {
+        scopeId: event.externalScopeId, threadId: bridgeSession.codexThreadId,
+        submittedAtMs: Date.now(), attachmentCount: event.attachments.length,
+        localImageCount: turnInput.filter(item => item.type === 'localImage').length,
+        mediaTimings: (event.metadata?.weixin as Record<string, unknown> | undefined)?.mediaTimings ?? [],
+      }, { envVar: null });
+    }
     const result = await client.startTurn({
       threadId: bridgeSession.codexThreadId,
       inputText: turnInput[0]?.type === 'text' ? turnInput[0].text : inputText,

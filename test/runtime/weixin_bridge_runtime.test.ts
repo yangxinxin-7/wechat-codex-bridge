@@ -554,6 +554,108 @@ test('WeixinBridgeRuntime merges an image-only inbound message with the next tex
   ]);
 });
 
+test('WeixinBridgeRuntime accepts arbitrary captions while an image downloads beyond the merge window', async () => {
+  let finishDownload!: (result: any) => void;
+  const attachmentDownload = new Promise<any>(resolve => { finishDownload = resolve; });
+  const seen: any[] = [];
+  const runtime = makeRuntime({ inboundAttachmentMergeWindowMs: 1,
+    sendText: async () => {}, coordinator: { async handleInboundEvent(event: any) {
+      seen.push(event); return completeResponse('收到');
+    } },
+  });
+  const photo = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '', attachmentDownload });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(seen, []);
+  const caption = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '加墨镜，再加一条红围巾' });
+  assert.deepEqual(seen, []);
+  finishDownload({ attachments: [{kind:'image',localPath:'/tmp/upload.jpg'}], errors: [], timings: [] });
+  await Promise.all([photo.completion, caption.completion]);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].text, '加墨镜，再加一条红围巾');
+  assert.equal(seen[0].attachments[0].localPath, '/tmp/upload.jpg');
+  assert.equal(seen[0].attachmentDownload, undefined);
+});
+
+test('WeixinBridgeRuntime queues late images behind an active text turn and merges following captions', async () => {
+  let finishTurn!: () => void;
+  const turnGate = new Promise<void>(resolve => { finishTurn = resolve; });
+  const seen: any[] = [];
+  const sent: string[] = [];
+  const runtime = makeRuntime({ inboundAttachmentMergeWindowMs: 1,
+    sendText: async ({content}) => { sent.push(content); },
+    coordinator: { async handleInboundEvent(event: any) {
+      seen.push(event);
+      if (event.text === '先处理这个') await turnGate;
+      return completeResponse('完成');
+    } },
+  });
+  const first = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'先处理这个'});
+  await new Promise(resolve => setImmediate(resolve));
+  const earlyCaption = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'戴墨镜'});
+  const photo = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'',attachments:[{kind:'image',localPath:'/tmp/late.jpg'}]});
+  await new Promise(resolve => setTimeout(resolve,10));
+  const caption = await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'再加上这个颜色'});
+  assert.equal(seen.length,1);
+  assert.deepEqual(sent,[]);
+  finishTurn();
+  await Promise.all([first.completion,earlyCaption.completion,photo.completion,caption.completion]);
+  assert.equal(seen.length,2);
+  assert.equal(seen[1].text,'戴墨镜\n\n再加上这个颜色');
+  assert.equal(seen[1].attachments.length,1);
+  assert.equal(runtime.pendingInboundMerges.size,0);
+});
+
+test('WeixinBridgeRuntime preserves the receipt order of concurrent media downloads', async () => {
+  let finishFirst!: (result:any)=>void;
+  let finishSecond!: (result:any)=>void;
+  const firstDownload = new Promise<any>(resolve=>{finishFirst=resolve;});
+  const secondDownload = new Promise<any>(resolve=>{finishSecond=resolve;});
+  const seen:any[]=[];
+  const runtime=makeRuntime({inboundAttachmentMergeWindowMs:1,sendText:async()=>{},coordinator:{async handleInboundEvent(event:any){seen.push(event);return completeResponse('收到');}}});
+  const one=await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'',attachmentDownload:firstDownload});
+  const two=await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'',attachmentDownload:secondDownload});
+  const caption=await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'比较一下'});
+  finishSecond({attachments:[{kind:'image',localPath:'/tmp/second.jpg'}],errors:[],timings:[]});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(seen,[]);
+  finishFirst({attachments:[{kind:'image',localPath:'/tmp/first.jpg'}],errors:[],timings:[]});
+  await Promise.all([one.completion,two.completion,caption.completion]);
+  assert.deepEqual(seen[0].attachments.map((a:any)=>a.localPath),['/tmp/first.jpg','/tmp/second.jpg']);
+});
+
+test('WeixinBridgeRuntime lets control commands run during a media download and reports download failure', async () => {
+  let finishDownload!:(result:any)=>void;
+  const attachmentDownload=new Promise<any>(resolve=>{finishDownload=resolve;});
+  const seen:string[]=[];
+  const sent:string[]=[];
+  const runtime=makeRuntime({inboundAttachmentMergeWindowMs:1,sendText:async({content})=>{sent.push(content);},coordinator:{async handleInboundEvent(event:any){seen.push(event.text);return completeResponse('状态正常');}}});
+  const photo=await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'',attachmentDownload});
+  await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'/status'});
+  assert.deepEqual(seen,['/status']);
+  finishDownload({attachments:[],errors:['download timed out'],timings:[]});
+  await photo.completion;
+  assert.deepEqual(seen,['/status']);
+  assert.match(sent[1],/附件下载失败/);
+  assert.equal(runtime.pendingInboundMerges.size,0);
+});
+
+for (const command of ['/stop', '/new']) {
+  test(`WeixinBridgeRuntime ${command} cancels pending media without waiting for its download`, async () => {
+    const seen:string[]=[];
+    const runtime=makeRuntime({inboundAttachmentMergeWindowMs:1,sendText:async()=>{},coordinator:{async handleInboundEvent(event:any){seen.push(event.text);return completeResponse('完成');}}});
+    const photo=await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'',attachmentDownload:new Promise<any>(()=>{})});
+    await runtime.flushPendingInboundMerge('wxid_1');
+    await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:command});
+    await photo.completion;
+    await runtime.waitForIdle();
+    const next=await runtime.dispatchInboundEvent({platform:'weixin',externalScopeId:'wxid_1',text:'下一条'});
+    await next.completion;
+    assert.deepEqual(seen,[command,'下一条']);
+    assert.equal(runtime.pendingInboundMerges.size,0);
+    assert.equal(runtime.scopeChains.size,0);
+  });
+}
+
 test('WeixinBridgeRuntime flushes an image-only inbound message after the merge window when no follow-up text arrives', async () => {
   const seen: Array<{ text: string; attachmentCount: number }> = [];
   const sent: Array<{ externalScopeId: string; content: string }> = [];
@@ -2194,7 +2296,7 @@ test('WeixinBridgeRuntime rewrites exhausted Codex credits into a specific user-
 
 
 
-test('WeixinBridgeRuntime replies immediately when a second plain-text message arrives during an active scope turn', async () => {
+test('WeixinBridgeRuntime queues a second plain-text message during an active scope turn', async () => {
   const sent: Array<{ externalScopeId: string; content: string }> = [];
   const started: string[] = [];
   let releaseFirst: (value?: unknown) => void = () => {};
@@ -2232,25 +2334,13 @@ test('WeixinBridgeRuntime replies immediately when a second plain-text message a
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.deepEqual(started, ['first']);
-  await second;
-  assert.deepEqual(started, ['first']);
-  assert.deepEqual(sent, [
-    {
-      externalScopeId: 'wxid_1',
-      content: '当前已有一轮回复在进行中。\n请先等待，或使用 /stop 中断。',
-    },
-  ]);
-
+  assert.deepEqual(sent, []);
   releaseFirst();
-  await first;
-
-  assert.deepEqual(started, ['first']);
+  await Promise.all([first, second]);
+  assert.deepEqual(started, ['first', 'second']);
   assert.deepEqual(sent, [
-    {
-      externalScopeId: 'wxid_1',
-      content: '当前已有一轮回复在进行中。\n请先等待，或使用 /stop 中断。',
-    },
     { externalScopeId: 'wxid_1', content: 'first answer' },
+    { externalScopeId: 'wxid_1', content: 'second answer' },
   ]);
 });
 

@@ -11,7 +11,7 @@ interface EventOutcome {
 
 interface WeixinPollerPlugin {
   loadSyncCursor?: () => string | null;
-  pollOnce(params: { syncCursor: string | null }): Promise<{ syncCursor?: string | null; events?: unknown[] }>;
+  pollOnce(params: { syncCursor: string | null; deferMedia?: boolean }): Promise<{ syncCursor?: string | null; events?: unknown[] }>;
   commitSyncCursor?: (syncCursor: string | null | undefined) => Promise<void>;
 }
 
@@ -60,7 +60,7 @@ export class WeixinPoller {
     this.nextSyncCursor = this.plugin.loadSyncCursor?.() ?? null;
     while (this.running) {
       try {
-        const result = await this.plugin.pollOnce({ syncCursor: this.nextSyncCursor });
+        const result = await this.plugin.pollOnce({ syncCursor: this.nextSyncCursor, deferMedia: true });
         this.nextSyncCursor = result?.syncCursor ?? this.nextSyncCursor;
         const dispatchOutcome = await this.dispatchEvents(result?.events ?? []);
         void dispatchOutcome.completion.catch(async (error) => {
