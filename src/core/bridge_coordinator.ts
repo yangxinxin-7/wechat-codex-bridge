@@ -11459,6 +11459,14 @@ export class BridgeCoordinator {
       bridgeSessionId: session.id,
       cwd: normalizeCwd(session.cwd) ?? this.resolveEventCwd(event),
       intent: null,
+      // Codex can retain the first developer instructions across turns. Keep
+      // their attachment directory stable while each delivery has its own spool.
+      artifactDir: typeof sessionSettings?.metadata?.attachmentDirectory === 'string'
+        ? sessionSettings.metadata.attachmentDirectory
+        : null,
+    });
+    this.bridgeSessions.upsertSessionSettings(session.id, {
+      metadata: { attachmentDirectory: turnArtifactContext.artifactDir },
     });
     const pendingArtifactDelivery = createPendingTurnArtifactDeliveryState(turnArtifactContext);
     ensureTurnArtifactDirectories(turnArtifactContext);

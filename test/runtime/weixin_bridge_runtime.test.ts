@@ -1506,7 +1506,7 @@ test('WeixinBridgeRuntime sends only the trailing tail when the final response e
   ]);
 });
 
-test('WeixinBridgeRuntime merges commentary and final-answer progress into the preview stream', async () => {
+test('WeixinBridgeRuntime keeps commentary separate from final-answer prefix matching', async () => {
   const sent: Array<{ externalScopeId: string; content: string }> = [];
   const runtime = makeRuntime({
     sendText: async ({ externalScopeId, content }) => {
@@ -1534,8 +1534,90 @@ test('WeixinBridgeRuntime merges commentary and final-answer progress into the p
 
   assert.deepEqual(sent, [
     { externalScopeId: 'wxid_1', content: '我先检查一下上下文。' },
-    { externalScopeId: 'wxid_1', content: '最终答案第一段。\n\n最终答案第二段。' },
+    { externalScopeId: 'wxid_1', content: '最终答案第一段。' },
+    { externalScopeId: 'wxid_1', content: '最终答案第二段。' },
   ]);
+});
+
+test('WeixinBridgeRuntime preserves repeated tokens after commentary and does not resend the full answer', async () => {
+  const sent: string[] = [];
+  const answer = 'LLM Memory 很好。接下来继续。';
+  const runtime = makeRuntime({
+    sendText: ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any = {}) {
+        await options.onProgress({ text: '我先查询。', delta: '我先查询。', outputKind: 'commentary' });
+        let text = '';
+        for (const delta of answer) {
+          text += delta;
+          await options.onProgress({ text, delta, outputKind: 'final_answer' });
+        }
+        return completeResponse(answer);
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.equal(sent[0], '我先查询。');
+  assert.equal(sent.slice(1).join('').replace(/\s/gu, ''), answer.replace(/\s/gu, ''));
+  assert.equal(sent.includes(answer), false);
+});
+
+test('WeixinBridgeRuntime keeps attachment manifests out of streamed replies', async () => {
+  const sent: string[] = [];
+  const runtime = makeRuntime({
+    sendText: ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any = {}) {
+        await options.onProgress({
+          text: '图片已生成。\n\n```codexbridge-artifacts\n[{"path":"/private/image.png"}]\n```',
+          outputKind: 'final_answer',
+        });
+        return completeResponse('图片已生成。');
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, ['图片已生成。']);
+});
+
+test('WeixinBridgeRuntime preserves repeated characters in cumulative commentary', async () => {
+  const sent: string[] = [];
+  const commentary = '我查询 LLM 和 AAA。';
+  const runtime = makeRuntime({
+    sendText: ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any = {}) {
+        let text = '';
+        for (const delta of commentary) {
+          text += delta;
+          await options.onProgress({ text, delta, outputKind: 'commentary' });
+        }
+        return completeResponse('完成。');
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, [commentary, '完成。']);
+});
+
+test('WeixinBridgeRuntime retries only the unsent tail after a partial final delivery', async () => {
+  const sent: string[] = [];
+  const runtime = makeRuntime({
+    sendText: ({ content }) => {
+      sent.push(content);
+      if (sent.length === 1) {
+        return {
+          success: false, deliveredCount: 1, deliveredText: '第一段。',
+          failedIndex: 1, failedText: '第二段。', error: 'transient delivery failure',
+        };
+      }
+    },
+    coordinator: {
+      async handleInboundEvent() { return completeResponse('第一段。\n\n第二段。'); },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, ['第一段。\n\n第二段。', '第二段。']);
 });
 
 test('WeixinBridgeRuntime dedupes overlapping cumulative final-answer updates in the preview stream', async () => {

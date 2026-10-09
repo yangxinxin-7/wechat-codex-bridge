@@ -79,7 +79,7 @@ export async function officialQrLogin(
         qrcode,
       });
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      if (error instanceof Error && (error.name === 'AbortError' || (error as Error & { code?: string }).code === 'ETIMEDOUT')) {
         await sleep(1000);
         continue;
       }

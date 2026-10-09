@@ -93,7 +93,9 @@ interface BridgeCoordinatorLike {
 }
 
 interface StreamState {
+  finalAnswerStarted: boolean;
   lastObservedFinal: string;
+  lastObservedCommentary: string;
   pendingPreview: string;
   previewPumpPromise: Promise<void> | null;
   previewStopped: boolean;
@@ -663,7 +665,17 @@ export class WeixinBridgeRuntime {
     });
     let delta = '';
     if (progress.outputKind === 'final_answer') {
-      const nextText = String(progress.text ?? '');
+      if (!streamState.finalAnswerStarted) {
+        // Commentary is separate from the final answer and must not participate
+        // in final-answer prefix matching.
+        await this.stopPreviewStreaming(streamState);
+        streamState.previewStopped = false;
+        streamState.streamedText = '';
+        streamState.sentChunkCount = 0;
+        streamState.finalAnswerStarted = true;
+      }
+      // The artifact manifest is transport metadata, not user-visible text.
+      const nextText = String(progress.text ?? '').replace(/\n?```codexbridge-artifacts[\s\S]*$/u, '');
       if (nextText) {
         if (streamState.lastObservedFinal) {
           if (!nextText.startsWith(streamState.lastObservedFinal)) {
@@ -677,17 +689,27 @@ export class WeixinBridgeRuntime {
           }
           delta = nextText.slice(streamState.lastObservedFinal.length);
         } else {
-          delta = String(progress.delta ?? nextText);
+          delta = nextText;
         }
         streamState.lastObservedFinal = nextText;
       } else {
         delta = String(progress.delta ?? '');
       }
     } else {
-      delta = String(progress.delta ?? progress.text ?? '');
+      if (streamState.finalAnswerStarted) {
+        return;
+      }
+      const nextText = String(progress.text ?? '');
+      if (nextText && nextText === streamState.lastObservedCommentary) {
+        return;
+      }
+      delta = nextText && streamState.lastObservedCommentary && nextText.startsWith(streamState.lastObservedCommentary)
+        ? nextText.slice(streamState.lastObservedCommentary.length)
+        : String(progress.delta ?? nextText);
+      if (nextText) {
+        streamState.lastObservedCommentary = nextText;
+      }
     }
-
-    delta = trimOverlappingPreviewDelta(streamState, delta);
     if (!delta) {
       return;
     }
@@ -909,7 +931,7 @@ export class WeixinBridgeRuntime {
       throw new Error(this.i18n.t('runtime.error.finalTextMissing', { scopeId: event.externalScopeId }));
     }
 
-    const previewText = isComparablePrefix(streamState.streamedText, finalText) ? streamState.streamedText : '';
+    let previewText = isComparablePrefix(streamState.streamedText, finalText) ? streamState.streamedText : '';
     if (normalizeComparableText(previewText) === normalizedFinal) {
         return {
           source: codexTurnMeta?.finalSource ?? 'thread_items',
@@ -959,6 +981,11 @@ export class WeixinBridgeRuntime {
         };
       }
       lastFailedDelivery = delivery;
+      if (delivery.deliveredText) {
+        previewText = previewText
+          ? `${previewText}\n\n${delivery.deliveredText}`
+          : delivery.deliveredText;
+      }
       debugRuntime('final_delivery_attempt_failed', {
         scopeId: event.externalScopeId,
         attempt,
@@ -1864,7 +1891,9 @@ export class WeixinBridgeRuntime {
 
 function createStreamState(): StreamState {
   return {
+    finalAnswerStarted: false,
     lastObservedFinal: '',
+    lastObservedCommentary: '',
     pendingPreview: '',
     previewPumpPromise: null,
     previewStopped: false,
@@ -1961,6 +1990,18 @@ function resolveFinalCommitContent(finalText: string, previewText: string): stri
     const trailing = finalContent.slice(previewContent.length).trim();
     return trailing || '';
   }
+  if (isComparablePrefix(previewContent, finalContent)) {
+    const prefixLength = normalizeComparableText(previewContent).length;
+    let matched = 0;
+    let offset = 0;
+    while (offset < finalContent.length && matched < prefixLength) {
+      if (!/\s/u.test(finalContent[offset])) {
+        matched += 1;
+      }
+      offset += 1;
+    }
+    return finalContent.slice(offset).trim();
+  }
   return finalContent;
 }
 
@@ -1978,34 +2019,6 @@ function appendPreviewText(streamState: StreamState, chunk: string): void {
   streamState.streamedText = streamState.streamedText
     ? `${streamState.streamedText}\n\n${chunk}`
     : chunk;
-}
-
-function trimOverlappingPreviewDelta(streamState: StreamState, delta: string): string {
-  const incoming = String(delta ?? '');
-  if (!incoming) {
-    return '';
-  }
-  const existing = getPreviewComparisonText(streamState);
-  if (!existing) {
-    return incoming;
-  }
-  if (existing.endsWith(incoming)) {
-    return '';
-  }
-  const maxOverlap = Math.min(existing.length, incoming.length);
-  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
-    if (existing.slice(-overlap) === incoming.slice(0, overlap)) {
-      return incoming.slice(overlap);
-    }
-  }
-  return incoming;
-}
-
-function getPreviewComparisonText(streamState: StreamState): string {
-  if (streamState.streamedText && streamState.pendingPreview) {
-    return `${streamState.streamedText}\n\n${streamState.pendingPreview}`;
-  }
-  return streamState.pendingPreview || streamState.streamedText || '';
 }
 
 function extractImmediatePreviewChunk(text: string, hardLimitBytes: number): string {
@@ -2312,8 +2325,5 @@ function extractAfterCommitAction(outcome: any): (() => Promise<void> | void) | 
 
 function normalizeComparableText(value) {
   return String(value ?? '')
-    .replace(/\r\n/g, '\n')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(/\s+/gu, '');
 }

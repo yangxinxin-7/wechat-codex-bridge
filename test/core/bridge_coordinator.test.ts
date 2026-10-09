@@ -1772,6 +1772,36 @@ test('/status details includes full diagnostics for the current session', async 
   assert.ok(lines.every((line) => !/完整信息：\/status details/.test(line)));
 });
 
+test('consecutive attachment turns accept the directory retained from the first turn', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-attachment-session-'));
+  const { runtime, openai } = makeRuntime({ defaultCwd: cwd });
+  const contexts: any[] = [];
+  let initialDirectory = '';
+  openai.startTurn = async ({ bridgeSession, event }) => {
+    const context = event.metadata.codexbridge.turnArtifactContext;
+    contexts.push(context);
+    initialDirectory ||= context.artifactDir;
+    const declaredPath = path.join(initialDirectory, `image-${contexts.length}.png`);
+    fs.writeFileSync(declaredPath, 'image-data');
+    return {
+      outputText: `完成。\n\`\`\`codexbridge-artifacts\n${JSON.stringify([{ path: declaredPath, kind: 'image' }])}\n\`\`\``,
+      threadId: bridgeSession.codexThreadId,
+    };
+  };
+  try {
+    for (let i = 0; i < 2; i += 1) {
+      const result = await runtime.services.bridgeCoordinator.handleInboundEvent({
+        platform: 'weixin', externalScopeId: 'wx-attachment-regression', text: '画张图发我',
+      });
+      assert.equal(result.messages.filter((message: any) => message.artifact).length, 1);
+    }
+    assert.equal(contexts[0].artifactDir, contexts[1].artifactDir);
+    assert.notEqual(contexts[0].spoolDir, contexts[1].spoolDir);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test('/status details includes the last artifact delivery status for the current session', async () => {
   const { runtime, openai } = makeRuntime({ defaultCwd: '/tmp/codexbridge-status-artifacts' });
   openai.startTurn = async ({ bridgeSession, event, onTurnStarted = null }) => {

@@ -3,8 +3,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { finalizeTurnArtifacts } from '../../src/core/turn_artifacts.js';
+import { createTurnArtifactContext, finalizeTurnArtifacts } from '../../src/core/turn_artifacts.js';
 import type { TurnArtifactContext } from '../../src/types/core.js';
+
+test('consecutive turns keep the session attachment directory and isolate delivery spools', () => {
+  const first = createTurnArtifactContext({ bridgeSessionId: 'session-1', cwd: '/tmp/project', intent: null });
+  const next = createTurnArtifactContext({
+    bridgeSessionId: 'session-1', cwd: '/tmp/project', intent: null, artifactDir: first.artifactDir,
+  });
+  assert.equal(next.artifactDir, first.artifactDir);
+  assert.notEqual(next.requestId, first.requestId);
+  assert.notEqual(next.spoolDir, first.spoolDir);
+});
 
 test('finalizeTurnArtifacts rejects symlinked manifest files that escape the turn artifact directory', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-artifacts-'));

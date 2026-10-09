@@ -1,0 +1,32 @@
+name: WeChat server checks
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: bash -n deploy/install-linux.sh
+      - name: Bridge and WeChat regression tests
+        env:
+          CODEXBRIDGE_ENABLE_AGENT_COMMAND: '1'
+        run: >-
+          node --import tsx --test
+          test/runtime/weixin_bridge_runtime.test.ts
+          test/runtime/linux_deploy.test.ts
+          test/core/turn_artifacts.test.ts
+          test/providers/codex/plugin.test.ts
+          test/providers/codex/app_client.test.ts
+          test/platforms/weixin/plugin.test.ts
+          test/platforms/weixin/poller.test.ts
+          test/platforms/weixin/official/login.test.ts
+      - name: Consecutive attachment turns
+        env:
+          CODEXBRIDGE_ENABLE_AGENT_COMMAND: '1'
+        run: node --import tsx --test --test-name-pattern='consecutive attachment' test/core/bridge_coordinator.test.ts

@@ -12,3 +12,6 @@ coverage/
 .codexbridge/
 reports/
 reference/
+.trial-*
+workspace/
+data/

@@ -1,5 +1,7 @@
 # CodexBridge
 
+本仓库包含微信图片回传和回复去重修复。Linux 服务器部署请先看 [部署说明](deploy/LINUX.md)。
+
 CodexBridge is a Codex-centered gateway for connecting multiple chat platforms to one shared Codex engine, while switching backend provider profiles inside Codex when needed.
 
 ## Current Direction

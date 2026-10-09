@@ -53,17 +53,19 @@ export function createTurnArtifactContext({
   bridgeSessionId,
   cwd,
   intent,
+  artifactDir,
 }: {
   bridgeSessionId: string;
   cwd?: string | null;
   intent: TurnArtifactIntent | null | undefined;
+  artifactDir?: string | null;
 }): TurnArtifactContext {
   const requestId = crypto.randomUUID();
   const baseDir = resolveArtifactBaseDir(cwd);
   return {
     requestId,
     bridgeSessionId,
-    artifactDir: path.join(baseDir, '.codexbridge', 'turn-artifacts', requestId),
+    artifactDir: artifactDir ?? path.join(baseDir, '.codexbridge', 'turn-artifacts', requestId),
     spoolDir: path.join(baseDir, '.codexbridge', 'artifact-spool', requestId),
     turnId: null,
     intent: intent ?? emptyIntent(),

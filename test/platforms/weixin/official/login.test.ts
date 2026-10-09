@@ -12,6 +12,23 @@ interface FetchMockStep {
   error?: Error;
 }
 
+test('officialQrLogin retries a timed out status request', async () => {
+  const saved: unknown[] = [];
+  const fetchImpl = createFetchMock([
+    { body: { qrcode: 'qr-retry', qrcode_img_content: 'https://qr.example.com' } },
+    { error: Object.assign(new Error('request timeout'), { code: 'ETIMEDOUT' }) },
+    { body: { status: 'confirmed', ilink_bot_id: 'bot-account', bot_token: 'bot-token' } },
+  ]);
+  const result = await officialQrLogin({
+    accountStore: { saveAccount: (account) => { saved.push(account); return {} as any; } },
+    fetchImpl,
+    timeoutSeconds: 1,
+    sleep: async () => {},
+  });
+  assert.equal(result?.account_id, 'bot-account');
+  assert.equal(saved.length, 1);
+});
+
 function createFetchMock(sequence: FetchMockStep[]) {
   return async (url: string): Promise<Response> => {
     const next = sequence.shift();
