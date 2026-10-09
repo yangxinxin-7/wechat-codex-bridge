@@ -62,6 +62,51 @@ function makePluginWithReviewRunner(clientFactory: any, reviewRunner: any) {
   });
 }
 
+test('profile defaults apply to new threads, chat, automation and review while session overrides win', async () => {
+  const calls: any[] = [];
+  const plugin = makePluginWithReviewRunner(() => ({
+    async start() {},
+    async startThread(params: any) {
+      calls.push(['thread', params.model]);
+      return { threadId: 'thread-1', cwd: params.cwd, title: null };
+    },
+    async startTurn(params: any) {
+      calls.push(['turn', params.model, params.effort]);
+      return { outputText: 'done', threadId: params.threadId, title: null };
+    },
+  }), {
+    async start(params: any) {
+      calls.push(['review', params.model, params.effort]);
+      return { outputText: 'done' };
+    },
+  });
+  const providerProfile = makeProfile({ defaultModel: 'gpt-6.1-sol', defaultReasoningEffort: 'medium' });
+  await plugin.startThread({ providerProfile, cwd: '/tmp/work' });
+  for (const automation of [false, true]) {
+    await plugin.startTurn({
+      providerProfile,
+      bridgeSession: makeBridgeSession(),
+      sessionSettings: makeSessionSettings(),
+      event: { platform: 'weixin', externalScopeId: 'owner', text: 'hello',
+        metadata: automation ? { codexbridge: { automationJobId: 'job-1' } } : {} },
+      inputText: 'hello',
+    });
+  }
+  await plugin.startReview({ providerProfile, sessionSettings: makeSessionSettings(), cwd: '/tmp/work', target: { type: 'uncommittedChanges' } });
+  await plugin.startTurn({
+    providerProfile, bridgeSession: makeBridgeSession(),
+    sessionSettings: makeSessionSettings({ model: 'gpt-test', reasoningEffort: 'high' }),
+    event: { platform: 'weixin', externalScopeId: 'owner', text: 'hello' }, inputText: 'hello',
+  });
+  assert.deepEqual(calls, [
+    ['thread', 'gpt-6.1-sol'],
+    ['turn', 'gpt-6.1-sol', 'medium'],
+    ['turn', 'gpt-6.1-sol', 'medium'],
+    ['review', 'gpt-6.1-sol', 'medium'],
+    ['turn', 'gpt-test', 'high'],
+  ]);
+});
+
 test('CodexProviderPlugin stop shuts down started app clients', async () => {
   const stopped: string[] = [];
   const plugin = makePlugin((profile: any) => ({

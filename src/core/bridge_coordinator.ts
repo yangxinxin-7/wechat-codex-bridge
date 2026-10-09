@@ -5349,7 +5349,7 @@ export class BridgeCoordinator {
     modelSource: 'session' | 'profile_default' | 'provider_default' | 'provider_first' | 'unset';
     description: string;
     effortValue: string;
-    effortSource: 'session' | 'model_default' | 'unset';
+    effortSource: 'session' | 'profile_default' | 'model_default' | 'unset';
     defaultReasoningEffort: string | null;
     supportedEffortsText: string;
   }> {
@@ -5390,13 +5390,16 @@ export class BridgeCoordinator {
     const modelValue = modelId ?? this.t('coordinator.model.currentDefault');
     const description = modelInfo ? this.resolveModelDescription(modelInfo, modelId ?? undefined) : '';
     const explicitEffort = this.normalizeConfiguredModelToken(settings?.reasoningEffort);
-    const defaultReasoningEffort = this.normalizeConfiguredModelToken(modelInfo?.defaultReasoningEffort);
+    const profileDefaultEffort = this.normalizeConfiguredModelToken(providerProfile.config?.defaultReasoningEffort);
+    const defaultReasoningEffort = profileDefaultEffort ?? this.normalizeConfiguredModelToken(modelInfo?.defaultReasoningEffort);
     const effortValue = explicitEffort ?? defaultReasoningEffort ?? this.t('common.default');
-    const effortSource: 'session' | 'model_default' | 'unset' = explicitEffort
+    const effortSource: 'session' | 'profile_default' | 'model_default' | 'unset' = explicitEffort
       ? 'session'
-      : defaultReasoningEffort
-        ? 'model_default'
-        : 'unset';
+      : profileDefaultEffort
+        ? 'profile_default'
+        : defaultReasoningEffort
+          ? 'model_default'
+          : 'unset';
 
     return {
       models,
@@ -5461,6 +5464,8 @@ export class BridgeCoordinator {
     switch (source) {
       case 'session':
         return this.t('coordinator.model.source.session');
+      case 'profile_default':
+        return this.t('coordinator.model.source.profileDefault');
       case 'model_default':
         return this.t('coordinator.model.source.modelDefault');
       default:

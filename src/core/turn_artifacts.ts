@@ -123,6 +123,8 @@ export function buildTurnArtifactDeveloperInstructions(context: TurnArtifactCont
     `When you do return deliverables, keep the number of returned files at or below ${limits.maxArtifactCount}.`,
     `When you do return deliverables, keep each declared file at or below ${limits.maxArtifactSizeBytes} bytes whenever practical.`,
     'Use absolute paths in the manifest whenever possible.',
+    'Image-generation tools may save images outside this directory or render them inline. Copy the final image into the attachment directory and declare it in the manifest.',
+    'To resend an earlier image, copy its existing local file into the attachment directory and declare it again. A Markdown image link alone is not an attachment.',
   ];
   if (context.intent.requestedFileName) {
     lines.push(`Use this exact filename for the final deliverable whenever practical: ${context.intent.requestedFileName}`);
@@ -162,6 +164,13 @@ export function finalizeTurnArtifacts({
   ensureTurnArtifactDirectories(context);
   const extracted = extractDeclaredArtifactsFromText(String(result?.outputText ?? ''));
   const declaredArtifacts = materializeDeclaredArtifacts(extracted.entries, context, limits.maxArtifactSizeBytes);
+  const linkedImages = materializeMarkdownImages(extracted.cleanText, result.threadId, context, limits.maxArtifactSizeBytes);
+  for (const image of linkedImages.artifacts) {
+    if (!declaredArtifacts.artifacts.some(artifact => sameLocalImage(artifact.path, image.path))) {
+      declaredArtifacts.artifacts.push(image);
+    }
+  }
+  extracted.cleanText = linkedImages.cleanText;
   const fallbackArtifacts = declaredArtifacts.artifacts.length === 0 && context.intent.requested
     ? collectFallbackArtifacts(context, limits.maxArtifactSizeBytes)
     : {
@@ -171,7 +180,10 @@ export function finalizeTurnArtifacts({
       noticeCode: null,
     };
   const outputArtifacts = dedupeArtifacts([
-    ...providerArtifacts,
+    // Code-mode image recovery may refer to the same bytes the model copied
+    // into its manifest. Keep the explicit filename/caption and send once.
+    ...providerArtifacts.filter((artifact) => !declaredArtifacts.artifacts.some((declared) =>
+      artifact.kind === 'image' && sameLocalImage(artifact.path, declared.path))),
     ...declaredArtifacts.artifacts,
     ...fallbackArtifacts.artifacts,
   ]);
@@ -789,6 +801,48 @@ function dedupeArtifacts(artifacts: OutputArtifact[]): OutputArtifact[] {
     });
   }
   return unique;
+}
+
+function sameLocalImage(firstPath: string, secondPath: string): boolean {
+  if (normalizeArtifactKind(null, secondPath) !== 'image') return false;
+  try {
+    const first = fs.statSync(firstPath);
+    const second = fs.statSync(secondPath);
+    if (!first.isFile() || !second.isFile() || first.size !== second.size) return false;
+    if (first.size > resolveTurnArtifactLimits().maxArtifactSizeBytes) return false;
+    return fs.readFileSync(firstPath).equals(fs.readFileSync(secondPath));
+  } catch {
+    return false;
+  }
+}
+
+function materializeMarkdownImages(text: string, threadId: string | null | undefined, context: TurnArtifactContext, maxBytes: number): {
+  cleanText: string; artifacts: OutputArtifact[];
+} {
+  const artifacts: OutputArtifact[] = [];
+  const roots = [context.artifactDir];
+  if (threadId && /^[a-z0-9-]+$/iu.test(threadId)) {
+    roots.push(path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'generated_images', threadId));
+  }
+  const cleanText = text.replace(/!\[([^\]]*)\]\((?:<([^>]+)>|([^\s)]+))(?:\s+"[^"]*")?\)/gu, (match, caption, anglePath, barePath) => {
+    let sourcePath = anglePath || barePath;
+    try { sourcePath = decodeURIComponent(sourcePath); } catch { return match; }
+    if (!path.isAbsolute(sourcePath) || normalizeArtifactKind(null, sourcePath) !== 'image') return match;
+    try {
+      const stat = fs.lstatSync(sourcePath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes) return match;
+      const realPath = fs.realpathSync(sourcePath);
+      if (!roots.some(root => {
+        try { return isWithinRoot(fs.realpathSync(root), realPath); } catch { return false; }
+      })) return match;
+      const displayName = sanitizeArtifactName(caption ? `${caption}${path.extname(sourcePath)}` : path.basename(sourcePath));
+      const spoolPath = copyArtifactToSpool(realPath, context.spoolDir, displayName);
+      artifacts.push({ kind: 'image', path: spoolPath, displayName, mimeType: normalizeMimeType(null, spoolPath),
+        sizeBytes: stat.size, caption: caption || null, source: 'bridge_declared', turnId: context.turnId });
+      return '';
+    } catch { return match; }
+  });
+  return { cleanText: normalizeUserVisibleText(cleanText), artifacts };
 }
 
 function applyArtifactDeliveryPolicy(

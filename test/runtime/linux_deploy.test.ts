@@ -35,6 +35,8 @@ test('Linux installer generates owner-only persistent service configuration with
     assert.match(content, /WEIXIN_DM_POLICY="allowlist"/);
     assert.match(content, /WEIXIN_ALLOWED_USERS="test-owner"/);
     assert.match(content, /CODEX_NATIVE_API_ENABLE="false"/);
+    assert.match(content, /CODEX_DEFAULT_MODEL="gpt-6.1-sol"/);
+    assert.match(content, /CODEX_DEFAULT_REASONING_EFFORT="medium"/);
     assert.match(content, /CODEXBRIDGE_FFMPEG_PATH=/);
     assert.doesNotMatch(content, /test-secret-not-for-env/);
     assert.equal(fs.statSync(envFile).mode & 0o777, 0o600);

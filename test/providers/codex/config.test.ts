@@ -5,6 +5,15 @@ import path from 'node:path';
 import test from 'node:test';
 import { loadCodexProfilesFromEnv, resolveCommand } from '../../../src/providers/codex/config.js';
 
+test('OpenAI-native profile loads explicit model and reasoning defaults', () => {
+  const { profiles } = loadCodexProfilesFromEnv({
+    CODEX_DEFAULT_MODEL: 'gpt-6.1-sol',
+    CODEX_DEFAULT_REASONING_EFFORT: 'medium',
+  });
+  assert.equal(profiles[0].config.defaultModel, 'gpt-6.1-sol');
+  assert.equal(profiles[0].config.defaultReasoningEffort, 'medium');
+});
+
 test('loadCodexProfilesFromEnv keeps Codex OpenAI as the default profile', () => {
   const result = loadCodexProfilesFromEnv({
     CODEX_REAL_BIN: '/usr/bin/codex',

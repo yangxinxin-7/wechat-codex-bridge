@@ -95,6 +95,7 @@ interface BridgeCoordinatorLike {
 interface StreamState {
   finalAnswerStarted: boolean;
   lastObservedFinal: string;
+  lastObservedFinalRaw: string;
   lastObservedCommentary: string;
   pendingPreview: string;
   previewPumpPromise: Promise<void> | null;
@@ -144,6 +145,7 @@ interface WeixinBridgeRuntimeOptions {
   agentJobs?: any;
   assistantRecords?: any;
   onError?: (error: unknown) => Promise<void> | void;
+  progressDeliveryEnabled?: boolean;
   previewSoftTargetBytes?: number;
   previewHardLimitBytes?: number;
   previewIntervalMs?: number;
@@ -170,6 +172,8 @@ export class WeixinBridgeRuntime {
   assistantRecords: any;
 
   onError: (error: unknown) => Promise<void> | void;
+
+  progressDeliveryEnabled: boolean;
 
   previewSoftTargetBytes: number;
 
@@ -218,6 +222,7 @@ export class WeixinBridgeRuntime {
     agentJobs = null,
     assistantRecords = null,
     onError = async () => {},
+    progressDeliveryEnabled = false,
     previewSoftTargetBytes = 2048,
     previewHardLimitBytes = 2048,
     previewIntervalMs = 3000,
@@ -233,6 +238,7 @@ export class WeixinBridgeRuntime {
     this.agentJobs = agentJobs;
     this.assistantRecords = assistantRecords;
     this.onError = onError;
+    this.progressDeliveryEnabled = progressDeliveryEnabled;
     this.previewSoftTargetBytes = previewSoftTargetBytes;
     this.previewHardLimitBytes = previewHardLimitBytes;
     this.previewIntervalMs = previewIntervalMs;
@@ -650,6 +656,7 @@ export class WeixinBridgeRuntime {
     if (
       !progress
       || !['commentary', 'final_answer'].includes(progress.outputKind)
+      || (!this.progressDeliveryEnabled && progress.outputKind !== 'final_answer')
       || streamState.streamingDisabled
       || streamState.previewStopped
     ) {
@@ -675,7 +682,9 @@ export class WeixinBridgeRuntime {
         streamState.finalAnswerStarted = true;
       }
       // The artifact manifest is transport metadata, not user-visible text.
-      const nextText = String(progress.text ?? '').replace(/\n?```codexbridge-artifacts[\s\S]*$/u, '');
+      const observedText = String(progress.text ?? '') || `${streamState.lastObservedFinalRaw}${String(progress.delta ?? '')}`;
+      streamState.lastObservedFinalRaw = observedText;
+      const nextText = stripStreamingArtifactManifest(observedText);
       if (nextText) {
         if (streamState.lastObservedFinal) {
           if (!nextText.startsWith(streamState.lastObservedFinal)) {
@@ -692,8 +701,6 @@ export class WeixinBridgeRuntime {
           delta = nextText;
         }
         streamState.lastObservedFinal = nextText;
-      } else {
-        delta = String(progress.delta ?? '');
       }
     } else {
       if (streamState.finalAnswerStarted) {
@@ -716,6 +723,9 @@ export class WeixinBridgeRuntime {
 
     streamState.pendingPreview += delta;
 
+    if (!this.progressDeliveryEnabled && utf8ByteLength(streamState.pendingPreview) < this.previewHardLimitBytes) {
+      return;
+    }
     this.ensurePreviewPump(event, streamState);
   }
 
@@ -733,6 +743,13 @@ export class WeixinBridgeRuntime {
     while (!streamState.previewStopped && !streamState.streamingDisabled) {
       if (!streamState.pendingPreview) {
         return;
+      }
+      if (!this.progressDeliveryEnabled) {
+        const chunk = extractFullAnswerChunk(streamState.pendingPreview, this.previewHardLimitBytes);
+        if (!chunk) return;
+        streamState.pendingPreview = streamState.pendingPreview.slice(chunk.length).replace(/^[\s\n]+/u, '');
+        await this.sendPreviewChunk(event, streamState, chunk.trim());
+        continue;
       }
       const waitUntil = Math.max(streamState.nextPreviewAt, streamState.smallPreviewDelayUntil);
       await waitForPreviewWindow(streamState, waitUntil);
@@ -794,7 +811,11 @@ export class WeixinBridgeRuntime {
       }
       return;
     }
-    appendPreviewText(streamState, delivery.deliveredText || normalizedChunk);
+    // Keep the raw answer prefix: the platform may strip Markdown before
+    // sending, but final continuation is matched against the raw final answer.
+    appendPreviewText(streamState, this.progressDeliveryEnabled
+      ? delivery.deliveredText || normalizedChunk
+      : normalizedChunk);
   }
 
   async stopPreviewStreaming(streamState: StreamState): Promise<void> {
@@ -1893,6 +1914,7 @@ function createStreamState(): StreamState {
   return {
     finalAnswerStarted: false,
     lastObservedFinal: '',
+    lastObservedFinalRaw: '',
     lastObservedCommentary: '',
     pendingPreview: '',
     previewPumpPromise: null,
@@ -2019,6 +2041,38 @@ function appendPreviewText(streamState: StreamState, chunk: string): void {
   streamState.streamedText = streamState.streamedText
     ? `${streamState.streamedText}\n\n${chunk}`
     : chunk;
+}
+
+function stripStreamingArtifactManifest(text: string): string {
+  const marker = '```codexbridge-artifacts';
+  const start = text.indexOf(marker);
+  if (start >= 0) return text.slice(0, start).replace(/\n$/u, '');
+  // A marker can arrive token by token. Hold its partial suffix so a chunk
+  // boundary cannot expose attachment metadata or break final prefix matching.
+  for (let length = marker.length - 1; length > 0; length -= 1) {
+    if (text.endsWith(marker.slice(0, length))) {
+      return text.slice(0, -length).replace(/\n$/u, '');
+    }
+  }
+  return text;
+}
+
+function extractFullAnswerChunk(text: string, byteLimit: number): string {
+  if (utf8ByteLength(text) < byteLimit) return '';
+  let bytes = 0;
+  let offset = 0;
+  let boundary = 0;
+  // Iterate code points so a forced split cannot cut an emoji in half.
+  for (const character of text) {
+    const next = utf8ByteLength(character);
+    if (bytes + next > byteLimit) break;
+    bytes += next;
+    offset += character.length;
+    if (bytes >= byteLimit * 0.75 && /[。！？.!?；;\n]/u.test(character)) {
+      boundary = offset;
+    }
+  }
+  return text.slice(0, boundary || offset);
 }
 
 function extractImmediatePreviewChunk(text: string, hardLimitBytes: number): string {

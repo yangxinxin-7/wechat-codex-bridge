@@ -17,6 +17,7 @@ interface CodexProviderConfig {
   launchCommand: string | null;
   autolaunch: boolean;
   defaultModel: string | null;
+  defaultReasoningEffort?: string | null;
   providerLabel: string;
   backendBaseUrl: string | null;
   apiKeyEnv: string | null;
@@ -90,7 +91,8 @@ export function loadCodexProfilesFromEnv(
         cliBin: codexRealBin,
         launchCommand: normalizeString(env.CODEX_APP_LAUNCH_CMD),
         autolaunch: parseBoolean(env.CODEX_APP_AUTOLAUNCH, false),
-        defaultModel: null,
+        defaultModel: normalizeString(env.CODEX_DEFAULT_MODEL),
+        defaultReasoningEffort: normalizeString(env.CODEX_DEFAULT_REASONING_EFFORT),
         providerLabel: 'openai',
         backendBaseUrl: null,
         apiKeyEnv: null,

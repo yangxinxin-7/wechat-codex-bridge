@@ -20,6 +20,111 @@ function expectedProviderNativeImageArtifact(imagePath: string, sizeBytes: numbe
   };
 }
 
+for (const stdio of [false, true]) {
+  test(`code-mode image output is delivered with final text (${stdio ? 'stdio' : 'thread items'})`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-code-image-test-'));
+    const sessionPath = path.join(dir, 'rollout.jsonl');
+    const imageBytes = Buffer.from('generated-image-current-turn');
+    const dataUrl = `data:image/png;base64,${imageBytes.toString('base64')}`;
+    const generatedCall = (id: string) => ({ type: 'response_item', payload: {
+      type: 'custom_tool_call', name: 'exec', call_id: id,
+      input: 'const r = await tools.image_gen__imagegen({prompt:"dog"}); generatedImage(r);',
+    } });
+    const output = (id: string, url: string) => ({ type: 'response_item', payload: {
+      type: 'custom_tool_call_output', call_id: id, output: [{ type: 'input_image', image_url: url }],
+    } });
+    fs.writeFileSync(sessionPath, [
+      generatedCall('old-call'), output('old-call', 'data:image/png;base64,b2xkLWltYWdl'),
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+      generatedCall('new-call'), output('new-call', dataUrl),
+      { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'view-call', input: 'image(await tools.view_image({path:"input.png"}));' } },
+      output('view-call', 'data:image/png;base64,dmlld2VkLWltYWdl'),
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: '画好啦' } },
+    ].map(x => JSON.stringify(x)).join('\n') + '\n');
+    let nowMs = 0;
+    let notified = false;
+    const client = new CodexAppClient({ codexCliBin: 'codex', turnPollNow: () => nowMs,
+      turnPollSleep: async ms => {
+        nowMs += ms;
+        if (notified) return;
+        notified = true;
+        client.emit('notification', { method: 'item/agentMessage/delta', params: {
+          threadId: 'thread-1', turnId: 'turn-1', itemId: 'final', phase: 'final_answer', delta: '画好啦',
+        } });
+        client.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+      },
+    });
+    if (stdio) client.transportKind = 'stdio';
+    client.request = async method => method === 'turn/start'
+      ? { turn: { id: 'turn-1' } }
+      : { thread: { id: 'thread-1', path: sessionPath, turns: [{ id: 'turn-1', status: 'completed',
+        items: [{ type: 'agentMessage', phase: 'final_answer', text: '画好啦' }],
+      }] } };
+    try {
+      const result = await client.startTurn({ threadId: 'thread-1', inputText: '你画个小狗发我', timeoutMs: 2500 });
+      assert.equal(result.outputText, '画好啦');
+      assert.equal(result.outputState, 'complete');
+      assert.equal(result.outputArtifacts.length, 1);
+      assert.equal(result.outputArtifacts[0].kind, 'image');
+      assert.deepEqual(fs.readFileSync(result.outputArtifacts[0].path), imageBytes);
+      fs.unlinkSync(result.outputArtifacts[0].path);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const scenario of ['resend', 'single-quotes', 'inspection', 'other-thread', 'old-turn']) {
+  test(`rendered generated image recovery: ${scenario}`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbridge-resend-'));
+    const previousHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = dir;
+    const imageDir = path.join(dir, 'generated_images', scenario === 'other-thread' ? 'other-thread' : 'thread-1');
+    fs.mkdirSync(imageDir, { recursive: true });
+    const imagePath = path.join(imageDir, 'cat.png');
+    const expectImage = ['resend', 'single-quotes'].includes(scenario);
+    fs.writeFileSync(imagePath, 'full-resolution-cat');
+    const call = { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'view',
+      input: scenario === 'single-quotes'
+        ? `const r = await tools.view_image({detail:'original', path:'${imagePath}'}); image(r.image_url);`
+        : `const r = await tools.view_image({path:${JSON.stringify(imagePath)}}); image(r.image_url);` } };
+    const output = { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'view',
+      output: [{ type: 'input_image', image_url: 'data:image/png;base64,cHJldmlldw==' }] } };
+    const start = { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } };
+    const sessionPath = path.join(dir, 'rollout.jsonl');
+    fs.writeFileSync(sessionPath, [
+      ...(scenario === 'old-turn' ? [call, output, start] : [start, call, output]),
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: '小猫来啦' } },
+    ].map(x => JSON.stringify(x)).join('\n'));
+    let nowMs = 0;
+    const client = new CodexAppClient({ codexCliBin: 'codex', turnPollNow: () => nowMs,
+      turnPollSleep: async ms => {
+        nowMs += ms;
+        client.emit('notification', { method: 'item/agentMessage/delta', params: {
+          threadId: 'thread-1', turnId: 'turn-1', itemId: 'final', phase: 'final_answer', delta: '小猫来啦',
+        } });
+        client.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+      },
+    });
+    client.transportKind = 'stdio';
+    client.request = async method => method === 'turn/start' ? { turn: { id: 'turn-1' } }
+      : { thread: { id: 'thread-1', path: sessionPath } };
+    try {
+      const result = await client.startTurn({ threadId: 'thread-1', inputText: '再重新发我下',
+        includeRenderedImages: scenario !== 'inspection', timeoutMs: 2500 });
+      assert.equal(result.outputArtifacts.length, expectImage ? 1 : 0);
+      if (expectImage) {
+        assert.equal(result.outputArtifacts[0].path, imagePath);
+        assert.equal(fs.readFileSync(result.outputArtifacts[0].path, 'utf8'), 'full-resolution-cat');
+      }
+    } finally {
+      if (previousHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousHome;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('CodexAppClient listThreads returns preview rows and nextCursor', async () => {
   const client = new CodexAppClient({
     codexCliBin: 'codex',

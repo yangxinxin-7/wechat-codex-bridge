@@ -49,6 +49,7 @@ interface CodexProviderProfileConfig extends Record<string, unknown> {
   modelCatalog?: unknown[];
   modelCatalogMode?: 'merge' | 'overlay-only';
   defaultModel?: string | null;
+  defaultReasoningEffort?: string | null;
 }
 
 type CodexProviderProfile = ProviderProfile & {
@@ -374,6 +375,7 @@ export class CodexProviderPlugin {
       configOverrides: permissionOverrides.configOverrides,
       collaborationMode: normalizeCodexCollaborationMode(sessionSettings?.collaborationMode ?? null),
       developerInstructions,
+      includeRenderedImages: /(?:重[新发传]|再.{0,12}(?:发|传|给)|(?:发|传).{0,12}(?:图|照片)|resend|send.{0,20}(?:again|image|picture))/iu.test(event.text),
       onProgress,
       onTurnStarted,
       onApprovalRequest,
@@ -414,7 +416,7 @@ export class CodexProviderPlugin {
   }): Promise<ProviderTurnResult> {
     const requestedModel = sessionSettings?.model ?? null;
     const config = providerProfile.config as CodexProviderProfileConfig;
-    const effort = sessionSettings?.reasoningEffort ?? null;
+    const effort = sessionSettings?.reasoningEffort ?? config.defaultReasoningEffort ?? null;
     const model = this.sanitizeRequestedModelForCurrentAuth(requestedModel)
       || this.sanitizeRequestedModelForCurrentAuth(config.defaultModel ?? null)
       || null;
@@ -751,7 +753,7 @@ export class CodexProviderPlugin {
     return resolveReasoningEffortForProvider({
       providerKind: providerProfile.providerKind,
       modelInfo,
-      requestedEffort,
+      requestedEffort: requestedEffort ?? (providerProfile.config as CodexProviderProfileConfig).defaultReasoningEffort ?? null,
     });
   }
 

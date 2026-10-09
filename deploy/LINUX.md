@@ -4,6 +4,8 @@
 
 包含修复：同一会话固定附件目录；回复分段去重；保留连续相同字符；部分发送失败时只重试未发送内容；隐藏附件清单；微信扫码超时重试。
 
+微信默认只发送正式答案，不发送过程说明或逐句预览。短回复生成结束后一次发送；长回复累积到 2048 UTF-8 字节（纯中文约 680 字）便先发送一段，尽量在完整句子处切分；生成结束后只发送剩余文字。
+
 ## 1. 安装依赖
 
 使用普通 Linux 用户运行。Ubuntu / Debian：
@@ -17,11 +19,11 @@ sudo apt-get install -y git python3 ffmpeg
 
 ```bash
 npm ci --ignore-scripts
-npm install -g @openai/codex@0.147.0 --include=optional
+npm install -g @openai/codex@0.162.0 --include=optional
 codex --version
 ```
 
-该 Codex 版本与本机验证一致。桥接通过 `tsx` 直接运行源码，不要求先编译整个上游工程。图片转码使用系统 `ffmpeg` / `ffprobe`，安装脚本会明确配置路径。
+2026-10-09 已在 Linux 服务器验证 Codex 0.162.0，使用 `gpt-6.1-sol`、`medium` 完成真实调用。桥接通过 `tsx` 直接运行源码，不要求先编译整个上游工程。图片转码使用系统 `ffmpeg` / `ffprobe`，安装脚本会明确配置路径。
 
 ## 2. 在服务器登录 Codex
 
@@ -53,6 +55,8 @@ bash scripts/service/status-systemd-user.sh
 
 需要支持 systemd 用户服务的 Linux 主机；若当前 SSH 会话不能连接用户服务总线，使用该用户正常登录后执行。安装脚本默认只允许扫码账号、禁用群聊和额外 HTTP API，并保留已有服务配置。服务会开机启动，异常退出后重启。
 
+新生成的服务配置默认使用 `gpt-6.1-sol`、`medium`，普通聊天、定时任务和审查均使用该配置。已有服务可在 `~/.config/codexbridge/weixin.service.env` 设置 `CODEX_DEFAULT_MODEL=gpt-6.1-sol` 和 `CODEX_DEFAULT_REASONING_EFFORT=medium` 后重启。会话内显式设置的 `/model` 优先于默认配置；`/model default` 恢复默认。
+
 文件位置：
 
 - 服务配置：`~/.config/codexbridge/weixin.service.env`。
@@ -76,4 +80,4 @@ systemctl --user stop com.ganxing.codexbridge-weixin.service
 
 ## 验证范围
 
-微信图片回传已经在本机真实验证，收发、会话、连接及本次修复的相关测试已通过。本机没有运行中的 Linux / Docker 环境，未实际安装 Linux systemd 服务。上游全量类型检查仍有 provider-relay 示例依赖等原有错误，不作为本部署的前置步骤。
+微信图片回传已经真实验证，收发、会话、连接及本次修复的相关测试已通过。2026-10-09 已安装并启动 Linux systemd 用户服务，并验证最新 Codex 的真实模型调用。上游全量类型检查仍有 provider-relay 示例依赖等原有错误，不作为本部署的前置步骤。

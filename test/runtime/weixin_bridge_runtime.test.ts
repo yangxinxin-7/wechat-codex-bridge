@@ -35,6 +35,7 @@ interface RuntimeHarnessOptions {
   sendMedia?: (payload: { externalScopeId: string; filePath: string; caption?: string | null }) => Promise<any> | any;
   sendTyping?: (payload: { externalScopeId: string; status: 'start' | 'stop' }) => Promise<void> | void;
   commitSyncCursor?: (syncCursor: string) => Promise<void> | void;
+  progressDeliveryEnabled?: boolean;
   previewSoftTargetBytes?: number;
   previewIntervalMs?: number;
   typingKeepaliveMs?: number;
@@ -53,6 +54,7 @@ function makeRuntime({
   sendMedia,
   sendTyping,
   commitSyncCursor,
+  progressDeliveryEnabled = true,
   previewSoftTargetBytes = 1,
   previewIntervalMs = 0,
   typingKeepaliveMs = 8000,
@@ -107,6 +109,7 @@ function makeRuntime({
     automationJobs,
     agentJobs,
     assistantRecords,
+    progressDeliveryEnabled,
     previewSoftTargetBytes,
     previewIntervalMs,
     typingKeepaliveMs,
@@ -129,6 +132,158 @@ function completeResponse(text: string) {
     },
   };
 }
+
+test('WeixinBridgeRuntime defaults to one final reply without commentary or answer previews', async () => {
+  const sent: string[] = [];
+  const final = '第一段。\n\n第二段。';
+  const harness = makeRuntime({
+    sendText: async ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any) {
+        await options.onProgress({ text: '我正在检查。', delta: '我正在检查。', outputKind: 'commentary' });
+        await options.onProgress({ text: '第一段。', delta: '第一段。', outputKind: 'final_answer' });
+        await options.onProgress({ text: final, outputKind: 'final_answer' });
+        assert.deepEqual(sent, []);
+        return completeResponse(final);
+      },
+    },
+  });
+  // Exercise the production constructor defaults, without the harness's
+  // explicit opt-in used by the legacy streaming tests.
+  const runtime = new WeixinBridgeRuntime({
+    platformPlugin: harness.platformPlugin,
+    bridgeCoordinator: harness.bridgeCoordinator,
+    internalThreadCleanupMs: 0,
+  });
+  assert.equal(runtime.progressDeliveryEnabled, false);
+  await runtime.runOnce();
+  assert.deepEqual(sent, [final]);
+});
+
+test('WeixinBridgeRuntime streams full answer chunks before completion and sends only the tail', async () => {
+  const sent: string[] = [];
+  const first = '甲'.repeat(650) + '。';
+  const second = '乙'.repeat(650) + '。';
+  const final = first + second + '剩余的小尾巴。';
+  const runtime = makeRuntime({
+    progressDeliveryEnabled: false,
+    sendText: async ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any) {
+        await options.onProgress({ text: '我正在检查。', outputKind: 'commentary' });
+        await options.onProgress({ text: first, outputKind: 'final_answer' });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(sent, []);
+        await options.onProgress({ text: first + second.slice(0, 50), outputKind: 'final_answer' });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(sent, [first]);
+        // Repeated cumulative updates must not trigger another send.
+        await options.onProgress({ text: first + second.slice(0, 50), outputKind: 'final_answer' });
+        await options.onProgress({ text: final, outputKind: 'final_answer' });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(sent, [first]);
+        return completeResponse(final);
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, [first, second + '剩余的小尾巴。']);
+  assert.equal(sent.join(''), final);
+});
+
+test('WeixinBridgeRuntime drains multiple full chunks and retains Unicode and Markdown prefix matching', async () => {
+  const sent: string[] = [];
+  const final = '标题**加粗**🐱' + '🐱'.repeat(1100) + '尾巴。';
+  const runtime = makeRuntime({
+    progressDeliveryEnabled: false,
+    sendText: async ({ content }) => {
+      sent.push(content);
+      // Simulate platform Markdown filtering, rather than echoing raw text.
+      return { success: true, deliveredText: content.replace(/\*\*/gu, ''), deliveredCount: 1 };
+    },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any) {
+        // Some providers send deltas without cumulative snapshots.
+        await options.onProgress({ delta: final, outputKind: 'final_answer' });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(sent.length, 2);
+        assert.ok(sent.every(chunk => Buffer.byteLength(chunk, 'utf8') <= 2048));
+        assert.ok(sent.every(chunk => !/[\uD800-\uDBFF]$/u.test(chunk)));
+        return completeResponse(final);
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.equal(sent.length, 3);
+  assert.equal(sent.join(''), final);
+});
+
+test('WeixinBridgeRuntime waits for an in-flight long-answer send before delivering the tail and hides manifests', async () => {
+  const sent: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const prefix = 'x'.repeat(2048);
+  const final = prefix + '尾部';
+  const runtime = makeRuntime({
+    progressDeliveryEnabled: false,
+    sendText: async ({ content }) => {
+      if (content === prefix) await gate;
+      sent.push(content);
+    },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any) {
+        await options.onProgress({ text: prefix, outputKind: 'final_answer' });
+        await options.onProgress({ text: final + '\n```codexbridge-artifacts\n' + 'secret'.repeat(500), outputKind: 'final_answer' });
+        setImmediate(release);
+        return completeResponse(final);
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, [prefix, '尾部']);
+});
+
+test('WeixinBridgeRuntime hides artifact manifests split across delta-only updates', async () => {
+  const sent: string[] = [];
+  const final = 'x'.repeat(2048) + '尾段。';
+  const runtime = makeRuntime({
+    progressDeliveryEnabled: false,
+    sendText: async ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any) {
+        for (const delta of [final, '\n```codexbridge-artifacts\n', 'metadata'.repeat(400), '\n```']) {
+          await options.onProgress({ delta, outputKind: 'final_answer' });
+          await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.deepEqual(sent, ['x'.repeat(2048)]);
+        return completeResponse(final);
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, ['x'.repeat(2048), '尾段。']);
+});
+
+test('WeixinBridgeRuntime holds incomplete artifact headers at the long-answer boundary', async () => {
+  const sent: string[] = [];
+  const final = 'x'.repeat(2035);
+  const runtime = makeRuntime({
+    progressDeliveryEnabled: false,
+    sendText: async ({ content }) => { sent.push(content); },
+    coordinator: {
+      async handleInboundEvent(_event: any, options: any) {
+        for (const delta of [final, '\n```codexbridge-', 'artifacts\n', 'metadata'.repeat(400), '\n```']) {
+          await options.onProgress({ delta, outputKind: 'final_answer' });
+          await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.deepEqual(sent, []);
+        return completeResponse(final);
+      },
+    },
+  });
+  await runtime.runOnce();
+  assert.deepEqual(sent, [final]);
+});
 
 test('WeixinBridgeRuntime forwards poll events into the bridge coordinator and sends the response', async () => {
   const seen: string[] = [];

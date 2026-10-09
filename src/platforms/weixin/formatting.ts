@@ -22,6 +22,9 @@ export function splitWeixinText(content: unknown, maxLength = 4000) {
     return [];
   }
   const deliveryLimit = Math.min(Number(maxLength) || 4000, WEIXIN_DELIVERY_LIMIT_BYTES);
+  if (utf8ByteLength(normalized) <= deliveryLimit) {
+    return [normalized];
+  }
   const units = [];
   for (const unit of splitDeliveryUnits(normalized)) {
     if (utf8ByteLength(unit) <= deliveryLimit) {
@@ -268,36 +271,27 @@ function findTruncationBoundary(text: string, maxBytes: number) {
   let bestBoundary = -1;
   let bestSentence = -1;
   let bytes = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    bytes += utf8ByteLength(text[index]);
-    if (bytes > maxBytes) {
-      break;
-    }
-    if (text[index] === '\n') {
-      bestBoundary = index;
-    }
-    if ('。！？.!?；;'.includes(text[index])) {
-      bestSentence = index + 1;
-    }
+  let offset = 0;
+  for (const character of text) {
+    bytes += utf8ByteLength(character);
+    if (bytes > maxBytes) break;
+    if (character === '\n') bestBoundary = offset;
+    offset += character.length;
+    if ('。！？.!?；;'.includes(character)) bestSentence = offset;
   }
-  if (bestBoundary > 0) {
-    return bestBoundary;
-  }
-  return bestSentence;
+  return bestBoundary > 0 ? bestBoundary : bestSentence;
 }
 
 function sliceByUtf8Bytes(text: string, maxBytes: number) {
   let bytes = 0;
-  let index = 0;
-  while (index < text.length) {
-    const next = utf8ByteLength(text[index]);
-    if (bytes + next > maxBytes) {
-      break;
-    }
+  let offset = 0;
+  for (const character of text) {
+    const next = utf8ByteLength(character);
+    if (bytes + next > maxBytes) break;
     bytes += next;
-    index += 1;
+    offset += character.length;
   }
-  return text.slice(0, index);
+  return text.slice(0, offset);
 }
 
 function utf8ByteLength(text: string) {

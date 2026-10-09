@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -703,6 +704,7 @@ export class CodexAppClient extends EventEmitter {
     configOverrides = null,
     collaborationMode = 'default',
     developerInstructions = '',
+    includeRenderedImages = false,
     onProgress = null,
     onTurnStarted = null,
     onApprovalRequest = null,
@@ -721,6 +723,7 @@ export class CodexAppClient extends EventEmitter {
     configOverrides?: Record<string, unknown> | null;
     collaborationMode?: string;
     developerInstructions?: string;
+    includeRenderedImages?: boolean;
     onProgress?: ((progress: ProviderTurnProgress) => Promise<void> | void) | null;
     onTurnStarted?: ((meta: Record<string, unknown>) => Promise<void> | void) | null;
     onApprovalRequest?: ((request: ProviderApprovalRequest) => Promise<void> | void) | null;
@@ -815,6 +818,7 @@ export class CodexAppClient extends EventEmitter {
     return this.waitForTurnResult({
       threadId,
       turnId: String(turn.id),
+      includeRenderedImages,
       onProgress,
       onApprovalRequest,
       timeoutMs,
@@ -1695,12 +1699,14 @@ export class CodexAppClient extends EventEmitter {
   async waitForTurnResult({
     threadId,
     turnId,
+    includeRenderedImages = false,
     onProgress,
     onApprovalRequest,
     timeoutMs,
   }: {
     threadId: string;
     turnId: string;
+    includeRenderedImages?: boolean;
     onProgress?: ((progress: ProviderTurnProgress) => Promise<void> | void) | null;
     onApprovalRequest?: ((request: ProviderApprovalRequest) => Promise<void> | void) | null;
     timeoutMs: number;
@@ -1927,6 +1933,23 @@ export class CodexAppClient extends EventEmitter {
             await this.turnPollSleep(250);
             continue;
           }
+          // Stdio follows notifications instead of polling turn items. Fetch
+          // the rollout once the turn ends so code-mode image outputs survive.
+          if (sawTerminalNotification) {
+            try {
+              thread = await this.readThread(threadId, false);
+              threadSummaryForFallback = thread;
+            } catch {
+              // Preserve text delivery when the rollout is unavailable.
+            }
+            const sessionState = inspectTurnCompletionFromSessionPath(thread?.path ?? null, turnId, { threadId, includeRenderedImages });
+            if (sessionState.outputArtifacts.length > 0) {
+              return buildSessionTaskCompleteResult({
+                turnId, threadId, title: thread?.title ?? null, status: 'completed',
+                previewText: progressState.finalAnswerText, sessionState,
+              });
+            }
+          }
           if (previewText) {
             const result = {
               turnId,
@@ -1987,6 +2010,7 @@ export class CodexAppClient extends EventEmitter {
           throw new Error(buildApprovedExecutionStallError(approvedExecutionStall));
         }
         if (turn && isTurnTerminal(turn.status)) {
+          const sessionState = inspectTurnCompletionFromSessionPath(thread?.path ?? null, turnId, { threadId, includeRenderedImages });
           const outputText = extractTurnOutputText(turn);
           if (outputText) {
             this.noteApprovedExecutionSignal({
@@ -1996,6 +2020,9 @@ export class CodexAppClient extends EventEmitter {
               markCompleted: true,
             });
             const outputArtifacts = extractTurnOutputArtifacts(turn);
+            for (const artifact of sessionState.outputArtifacts) {
+              if (!outputArtifacts.some((entry) => entry.path === artifact.path)) outputArtifacts.push(artifact);
+            }
             const result = {
               turnId,
               threadId,
@@ -2034,7 +2061,6 @@ export class CodexAppClient extends EventEmitter {
             this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
             return result;
           }
-          const sessionState = inspectTurnCompletionFromSessionPath(thread?.path ?? null, turnId);
           const hasAssistantVisibleItems = turn.items.some((item) => isAssistantVisibleItem(item));
           const completionState = classifyTurnCompletionState(turn);
           this.logDebug('turn_terminal_state', {
@@ -3877,7 +3903,7 @@ function materializeInlineImage(savedPath, buffer) {
   }
 }
 
-function inspectTurnCompletionFromSessionPath(sessionPath, turnId) {
+function inspectTurnCompletionFromSessionPath(sessionPath, turnId, options: { threadId: string | null; includeRenderedImages: boolean } = { threadId: null, includeRenderedImages: false }) {
   if (!sessionPath || !turnId || !fs.existsSync(sessionPath)) {
     return {
       hasTaskComplete: false,
@@ -3911,6 +3937,7 @@ function inspectTurnCompletionFromSessionPath(sessionPath, turnId) {
       const toolSuggestionMessage = findSessionToolSuggestionMessageForTurn(lines, index, turnId);
       const runtimeError = findSessionRuntimeErrorForTurn(lines, index, turnId);
       return inspectSessionTurnArtifacts(lines, index, {
+        ...options,
         hasTaskComplete: true,
         lastAgentMessage,
         toolSuggestionMessage,
@@ -4102,9 +4129,39 @@ function normalizeRateLimitNumber(value: unknown): number | null {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function decodeSingleQuotedToolPath(literal: string): string {
+  const escapes = { "'": "'", '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+  return literal.slice(1, -1).replace(/\\(u[0-9a-fA-F]{4}|.)/gu, (_match, escape: string) => {
+    if (escape.startsWith('u') && escape.length === 5) return String.fromCharCode(parseInt(escape.slice(1), 16));
+    if (Object.hasOwn(escapes, escape)) return escapes[escape];
+    throw new Error('Unsupported tool path escape');
+  });
+}
+
+function resolveRenderedGeneratedImage(code: string, threadId: string | null): string | null {
+  if (!threadId || !/^[a-zA-Z0-9-]+$/u.test(threadId)) return null;
+  const match = code.match(/\btools\.view_image\s*\(\s*\{[^{}]*?\bpath\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/u);
+  if (!match) return null;
+  try {
+    const literal = match[1];
+    const imagePath = literal.startsWith('"') ? JSON.parse(literal) : decodeSingleQuotedToolPath(literal);
+    if (!path.isAbsolute(imagePath) || !fs.lstatSync(imagePath).isFile()) return null;
+    const root = fs.realpathSync(path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'generated_images', threadId));
+    const realPath = fs.realpathSync(imagePath);
+    const relative = path.relative(root, realPath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    if (!/\.(png|jpe?g|webp|gif)$/iu.test(realPath)) return null;
+    const size = fs.statSync(realPath).size;
+    return size > 0 && size <= 25 * 1024 * 1024 ? realPath : null;
+  } catch {
+    return null;
+  }
+}
+
 function inspectSessionTurnArtifacts(lines, taskCompleteIndex, state) {
   const outputArtifacts = [];
   const seenArtifacts = new Set<string>();
+  const imageOutputs = new Map<string, any[]>();
   for (let index = taskCompleteIndex - 1; index >= 0; index -= 1) {
     const line = lines[index]?.trim();
     if (!line) {
@@ -4119,6 +4176,42 @@ function inspectSessionTurnArtifacts(lines, taskCompleteIndex, state) {
     const payload = entry?.payload ?? null;
     if (entry?.type === 'event_msg' && payload?.type === 'task_started') {
       break;
+    }
+    if (entry?.type === 'response_item') {
+      const callId = String(payload?.call_id ?? '');
+      if (callId && ['custom_tool_call_output', 'function_call_output'].includes(payload?.type)
+        && Array.isArray(payload.output)) {
+        imageOutputs.set(callId, payload.output);
+      }
+      const code = String(payload?.input ?? payload?.arguments ?? '');
+      const generatesImage = ['image_gen.imagegen', 'image_gen__imagegen', 'imagegen'].includes(payload?.name)
+        || (['exec', 'functions.exec'].includes(payload?.name)
+          && /\btools\.image_gen__imagegen\s*\(/u.test(code)
+          && /\bgeneratedImage\s*\(/u.test(code));
+      // Explicit resends may render a saved generated image through view_image.
+      // Use the original file, bounded to this thread, rather than its preview.
+      if (callId && state.includeRenderedImages && ['exec', 'functions.exec'].includes(payload?.name)
+        && ['custom_tool_call', 'function_call'].includes(payload?.type)
+        && /\bimage\s*\(/u.test(code)
+        && (imageOutputs.get(callId) ?? []).some(content => content?.type === 'input_image')) {
+        const imagePath = resolveRenderedGeneratedImage(code, state.threadId);
+        if (imagePath && !seenArtifacts.has(imagePath)) {
+          seenArtifacts.add(imagePath);
+          outputArtifacts.unshift(buildArtifactFromFilePath(imagePath));
+        }
+      }
+      if (callId && generatesImage && ['custom_tool_call', 'function_call'].includes(payload?.type)) {
+        for (const content of imageOutputs.get(callId) ?? []) {
+          if (content?.type !== 'input_image') continue;
+          const buffer = decodeInlineImagePayload(content.image_url);
+          if (!buffer) continue;
+          const digest = createHash('sha256').update(buffer).digest('hex');
+          const imagePath = materializeInlineImage(path.join(os.tmpdir(), `codexbridge-generated-${digest}.png`), buffer);
+          if (!imagePath || seenArtifacts.has(imagePath)) continue;
+          seenArtifacts.add(imagePath);
+          outputArtifacts.unshift(buildArtifactFromFilePath(imagePath));
+        }
+      }
     }
     if (entry?.type !== 'event_msg' || payload?.type !== 'image_generation_end') {
       continue;
